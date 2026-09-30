@@ -2,11 +2,12 @@
 ---
 --- A per-Space, per-screen "tuck shelf" for macOS application windows.
 ---
---- Press the tuck shortcut (default Fn+T), then an arrow key, to minimize
---- the focused window and park a small visual card for it against the
---- edge of the screen you chose. Click a card, or press the untuck
---- shortcut (default Cmd+Shift+T) followed by the application's name, to
---- bring it back exactly where it was.
+--- One shortcut (default Fn+T) drives everything. Press it, then an arrow
+--- key to tuck the focused window: it is hidden (Cmd+H style where that
+--- is exactly per-window, minimized otherwise) and a small card parks
+--- against the chosen screen edge. Press it, then letters, to search the
+--- tucked applications by name and bring one back exactly where it was.
+--- Clicking a card restores it too.
 ---
 --- See the repository README.md for full documentation, configuration
 --- options, and known limitations.
@@ -104,12 +105,14 @@ function obj:_build()
   self.cardManager = CardManager.new(hs, self.store, self.spaceManager, self.iconManager, self.logger, self.config)
   self.windowManager = WindowManager.new(hs, self.store, self.cardManager, self.spaceManager, self.previewManager, self.logger, self.config)
   self.tracker = Tracker.new(hs, self.logger)
+  self.windowManager.listWindows = function()
+    return self.tracker:allWindows()
+  end
   self.shortcutManager = Shortcut.new(hs)
   self.shortcutManager:setLogger(self.logger)
   self.inputStateMachine = InputStateMachine.new()
 
-  self.directionTimer = nil
-  self.searchTimer = nil
+  self.commandTimer = nil
 
   -- Card clicks flow through the state machine too (so a click during an
   -- active keyboard search correctly cancels/collapses the search), then
@@ -129,6 +132,15 @@ function obj:_build()
   self.tracker.onUnminimized = function(window, _appName)
     this.windowManager:handleUnminimized(window)
   end
+  self.tracker.onAppHidden = function(app, _appName)
+    this.windowManager:handleAppHidden(app)
+  end
+  self.tracker.onAppUnhidden = function(app, _appName)
+    this.windowManager:handleAppUnhidden(app)
+  end
+  self.tracker.onAppTerminated = function(app, _appName)
+    this.windowManager:handleAppTerminated(app)
+  end
   self.tracker.onDestroyed = function(window, _appName)
     this.windowManager:handleDestroyed(window)
   end
@@ -136,34 +148,23 @@ function obj:_build()
   self._built = true
 end
 
---- Cancel both mode timers. Idempotent.
+--- Cancel the command timer. Idempotent.
 function obj:_cancelTimers()
-  if self.directionTimer then
-    self.directionTimer:stop()
-    self.directionTimer = nil
-  end
-  if self.searchTimer then
-    self.searchTimer:stop()
-    self.searchTimer = nil
+  if self.commandTimer then
+    self.commandTimer:stop()
+    self.commandTimer = nil
   end
 end
 
-function obj:_startDirectionTimer()
-  if self.directionTimer then
-    self.directionTimer:stop()
+--- (Re)start the single command timeout (shortcut accepted, and after
+-- every accepted search letter).
+function obj:_startCommandTimer()
+  if self.commandTimer then
+    self.commandTimer:stop()
   end
   local this = self
-  self.directionTimer = hs.timer.doAfter(self.config.input.directionTimeout, function()
-    this:_dispatch(this.inputStateMachine:timeoutFired())
-  end)
-end
-
-function obj:_startSearchTimer()
-  if self.searchTimer then
-    self.searchTimer:stop()
-  end
-  local this = self
-  self.searchTimer = hs.timer.doAfter(self.config.input.searchTimeout, function()
+  self.commandTimer = hs.timer.doAfter(self.config.input.commandTimeout, function()
+    this.commandTimer = nil
     this:_dispatch(this.inputStateMachine:timeoutFired())
   end)
 end
@@ -200,12 +201,10 @@ end
 function obj:_dispatch(res)
   if not res or res.action == "none" then
     return
-  elseif res.action == "startDirectionTimer" then
-    self:_startDirectionTimer()
-  elseif res.action == "startSearchTimer" then
-    self:_startSearchTimer()
-  elseif res.action == "restartSearchTimer" then
-    self:_startSearchTimer()
+  elseif res.action == "startCommandTimer" then
+    self:_startCommandTimer()
+  elseif res.action == "restartCommandTimer" then
+    self:_startCommandTimer()
     local tuckIDs = {}
     for _, m in ipairs(res.matches or {}) do
       tuckIDs[#tuckIDs + 1] = m.tuckID
@@ -234,65 +233,76 @@ end
 -- ---------------------------------------------------------------------
 
 --- A single, always-present eventtap that only ever intercepts keys
--- while the input state machine is NOT idle, and even then only the
--- specific keys meaningful to the active mode (arrows+Esc while
--- selecting a direction; A-Z+Esc while searching). Every other key,
--- and every key while idle, passes through completely untouched --
--- this Spoon never swallows unrelated global keyboard events.
+-- while the input state machine is in its command state, and even then
+-- only what the command uses: arrows (to tuck, before any search letter)
+-- and bare letters (to search), plus Esc. Every other key, and every key
+-- while idle, passes through untouched -- this Spoon never swallows
+-- unrelated global keyboard events.
 function obj:_ensureInputTap()
   if self.inputTap then
     return
   end
   local this = self
   self.inputTap = hs.eventtap.new({ hs.eventtap.event.types.keyDown }, function(event)
-    local state = this.inputStateMachine:current()
-    if state == "idle" then
+    local sm = this.inputStateMachine
+    if sm:current() == "idle" then
       return false
     end
 
     local keyCode = event:getKeyCode()
+    local flags = event:getFlags()
+
+    -- The keystroke that opened the command (the shared shortcut) must
+    -- never be re-read as command input.
+    local spec = this.config.shortcuts.tuck
+    if keyCode == hs.keycodes.map[spec.key:lower()] and Shortcut._flagsMatch(flags, spec.mods or {}) then
+      return false
+    end
 
     if keyCode == hs.keycodes.map["escape"] then
-      this:_dispatch(this.inputStateMachine:escPressed())
+      this:_dispatch(sm:escPressed())
       return true
     end
 
-    if state == "waitingForDirection" then
-      local arrowNames = {
-        [hs.keycodes.map["left"]] = "Left",
-        [hs.keycodes.map["right"]] = "Right",
-        [hs.keycodes.map["up"]] = "Up",
-        [hs.keycodes.map["down"]] = "Down",
-      }
-      local arrowName = arrowNames[keyCode]
-      if arrowName then
-        this:_dispatch(this.inputStateMachine:arrowPressed(arrowName))
-        return true
-      end
-      return false
-    elseif state == "waitingForAppLetter" then
-      local flags = event:getFlags()
-      -- Only bare letters (no Cmd/Alt/Ctrl) count as search input. This
-      -- also prevents the very keystroke that triggered a Cmd/Ctrl/Alt-
-      -- modified untuck shortcut (e.g. Cmd+Shift+T) from being
-      -- double-counted as the first search letter: at the instant that
-      -- shortcut fires, Cmd is still physically held down, so this
-      -- branch correctly ignores that specific event.
-      if flags.cmd or flags.alt or flags.ctrl then
-        return false
-      end
-      local ok, chars = pcall(function()
-        return event:getCharacters()
-      end)
-      if ok and type(chars) == "string" and chars:match("^[A-Za-z]$") then
-        this:_dispatch(this.inputStateMachine:letterPressed(chars, function(query)
-          return this:_matchCandidates(query)
-        end))
-        return true
-      end
-      return false
+    -- Ignore key auto-repeat so a held letter cannot spam the search.
+    local okRep, isRepeat = pcall(function()
+      return event:getProperty(hs.eventtap.event.properties.keyboardEventAutorepeat)
+    end)
+    if okRep and isRepeat == 1 then
+      return true
     end
 
+    local arrowNames = {
+      [hs.keycodes.map["left"]] = "Left",
+      [hs.keycodes.map["right"]] = "Right",
+      [hs.keycodes.map["up"]] = "Up",
+      [hs.keycodes.map["down"]] = "Down",
+    }
+    local arrowName = arrowNames[keyCode]
+    if arrowName then
+      -- Arrows only ever tuck (never restore), and only before a search
+      -- letter has been typed; during a search they pass through.
+      if sm:isSearching() then
+        return false
+      end
+      this:_dispatch(sm:arrowPressed(arrowName))
+      return true
+    end
+
+    -- Letters: bare keys only (Shift is fine); Cmd/Alt/Ctrl combos are
+    -- other shortcuts and are left alone.
+    if flags.cmd or flags.alt or flags.ctrl then
+      return false
+    end
+    local ok, chars = pcall(function()
+      return event:getCharacters()
+    end)
+    if ok and type(chars) == "string" and chars:match("^[A-Za-z]$") then
+      this:_dispatch(sm:letterPressed(chars, function(query)
+        return this:_matchCandidates(query)
+      end))
+      return true
+    end
     return false
   end)
   self.inputTap:start()
@@ -360,11 +370,9 @@ function obj:start()
 
   self:_build()
 
+  -- ONE shortcut: what follows it (arrow vs letter) decides tuck vs search.
   self.shortcutManager:bind(self.config.shortcuts.tuck, function()
-    self:_dispatch(self.inputStateMachine:tuckShortcutPressed())
-  end)
-  self.shortcutManager:bind(self.config.shortcuts.untuck, function()
-    self:_dispatch(self.inputStateMachine:untuckShortcutPressed(self.config.search.scope))
+    self:_dispatch(self.inputStateMachine:commandShortcutPressed())
   end)
 
   self:_ensureInputTap()
@@ -377,6 +385,10 @@ function obj:start()
   end)
 
   self.persistence:reportPreviousSession()
+
+  -- A restart after stop() (or a reload of the config with the same Lua
+  -- state) rebuilds cards for records that are still tucked.
+  self.cardManager:reflowAll()
 
   self._started = true
   self.logger.i("Tuck: started")

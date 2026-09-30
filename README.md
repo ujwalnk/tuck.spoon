@@ -1,12 +1,15 @@
 # Tuck.spoon
 
 Tuck is a per-Space, per-screen "tuck shelf" for macOS application
-windows. Instead of switching to another Space or digging through
-Mission Control, you tuck a window against an edge of your current
-screen: the real window is minimized the normal macOS way, and a small
-visual card takes its place on the edge you chose. Click the card, or
-type the app's name, to bring the window straight back to exactly where
-it was.
+windows. You tuck a window against an edge of your current screen: the
+real window is hidden the way Cmd+H hides it (see "How windows are
+hidden" for the one place it minimizes instead), and a small card takes
+its place, parked mostly off-screen until you approach the edge. Click
+the card, or type the app's name, to bring the window straight back to
+exactly where it was.
+
+**One shortcut does everything:** `Fn+T`, then an arrow to tuck, or
+letters to search and restore.
 
 Every screen/Space combination has its own independent set of shelves,
 so a card you tuck on your laptop display in Space 1 never shows up on
@@ -38,19 +41,12 @@ an external display, or on Space 2, or anywhere else.
 
 ## Permissions
 
-- **Accessibility**: the first time Hammerspoon tries to minimize,
-  move, or inspect a window, macOS will prompt you to grant
-  Accessibility permission in System Settings → Privacy & Security →
-  Accessibility, if you haven't already. Tuck cannot function at all
-  without this.
-- **Screen Recording**: entirely optional. Tuck checks
-  `hs.screenRecordingState(false)` (without prompting) before every
-  capture attempt, so a missing Screen Recording permission never
-  interrupts a tuck or triggers a permission dialog. If it's
-  unavailable, cards simply show the application's icon and name
-  instead of a thumbnail. Grant it in System Settings → Privacy &
-  Security → Screen Recording if you want thumbnails, and reload
-  Hammerspoon afterward.
+- **Accessibility**: required for Hammerspoon to inspect, hide, and
+  focus windows at all. macOS prompts the first time.
+- **Screen Recording**: optional. It only enables thumbnails. Tuck checks
+  `hs.screenRecordingState(false)` (never prompting) and captures the
+  thumbnail *before* hiding the window (a hidden window cannot be
+  captured). Without it, cards show the app icon and name instead.
 
 ## Starting/stopping
 
@@ -60,74 +56,93 @@ spoon.Tuck:stop()    -- idempotent; unbinds shortcuts, stops watchers,
                      -- destroys every card canvas
 ```
 
-## Default shortcuts
+## Shortcut
 
-| Action | Default | Configurable key |
+| Action | Default | Key |
 | --- | --- | --- |
-| Tuck (enter direction-selection mode) | `Fn+T` | `shortcuts.tuck` |
-| Untuck (enter application-search mode) | `Cmd+Shift+T` | `shortcuts.untuck` |
+| Start a Tuck command (tuck **or** untuck) | `Fn+T` | `shortcuts.tuck` |
 
-`Fn` is not a normal `hs.hotkey` modifier, so any shortcut spec that
-includes `"fn"` is registered through a shared `hs.eventtap` instead of
-`hs.hotkey`; this is entirely internal — the rest of the Spoon (and you,
-configuring it) never has to think about which mechanism is in use.
+There is no separate untuck shortcut. After `Fn+T`:
+
+| Next key | Result |
+| --- | --- |
+| `←` `→` `↑` `↓` | tuck the focused window to that edge |
+| `A`–`Z` | search tucked apps by name and restore |
+| `Esc` | cancel |
+| (nothing for `input.commandTimeout`, default 1.5 s) | cancel |
+
+`Fn` is not a normal `hs.hotkey` modifier, so shortcuts containing
+`"fn"` use a shared `hs.eventtap`; that is internal. Only the exact
+shortcut is consumed; every other key passes through untouched.
+
+Notes: to search for an app starting with **T** while your shortcut is
+`Fn+T`, release `Fn` first (holding it re-triggers the shortcut). Once
+you have typed a search letter, arrow keys are ignored (they never
+restore anything, and never tuck mid-search).
 
 ## Tuck workflow
 
-1. Press the tuck shortcut. Tuck enters a short direction-selection
-   window (default 1.5s, configurable).
-2. Press an arrow key:
-   - **Left** → tuck to the left rail
-   - **Right** → tuck to the right rail
-   - **Up** → tuck to the top rail
-   - **Down** → tuck to the bottom rail
-3. The focused window is minimized the normal macOS way (it is never
-   moved off-screen, resized, or faked with frame tricks — it stays
-   under ordinary macOS minimized-window management) and a card appears
-   on the chosen rail.
+1. Press `Fn+T`.
+2. Press an arrow: **Left / Right / Up / Down** tucks the currently
+   focused window to that rail.
+3. The window is captured (frame, app, icon, thumbnail), then hidden. Its
+   frame is never changed, it is never moved off-screen, and it is never
+   resized. A card appears on the rail.
 
-Press **Esc** at any point during direction-selection to cancel without
-changing anything. If no arrow is pressed before the timeout, Tuck
-silently returns to idle.
+`Esc`, or letting the timeout expire, cancels without touching anything.
+Windows on All Spaces are refused (see below).
 
-Arrow keys are *only* ever used for choosing a tuck direction. They are
-never used for untucking, and they do nothing outside of
-direction-selection mode.
+## How windows are hidden
+
+macOS and Hammerspoon only offer hiding at **application** level
+(`hs.application:hide()`, exactly what Cmd+H does). There is no
+per-window hide in `hs.window` or the Accessibility API, and unhiding an
+app reveals every un-minimized window it owns. Tuck's model is one record
+per *window*, so app-level hiding is used only where it is exactly
+equivalent to hiding that one window:
+
+| Situation when you tuck | Mechanism | Stored as |
+| --- | --- | --- |
+| It is the app's **only** non-minimized window (on any Space) and the app has no other tuck | app hide (`Cmd+H` style) | `mechanism = "hide"` |
+| Anything else (sibling windows open, or the app already has a tucked window) | window minimize | `mechanism = "minimize"` |
+
+So tucking Safari window A while B and C are open minimizes A; B and C
+are never hidden or revealed as a side effect. Restore reverses exactly
+what tuck did, and always focuses the specific window by its window ID
+(never "the app's main window"). A hide-tucked window is always the only
+tuck record of its app, so an unhide can never reveal something that is
+still supposed to be tucked.
+
+This limitation is inherent to the platform, not to Tuck. Window
+enumeration for the "any Space" check comes from the window filter, which
+learns about windows on other Spaces as it observes them; if it cannot
+tell, Tuck chooses minimize (the safe option).
 
 ## Untuck workflow
 
-There are exactly two ways to bring a tucked window back:
-
 ### 1. Click the card
 
-Clicking a card immediately restores the window it represents: the
-window is unminimized, its exact pre-tuck frame is restored, and it is
-focused and raised. This works even if a keyboard search is currently in
-progress — clicking a card always wins immediately, cancels the search,
-and collapses any other cards that had expanded for the search.
+Restores that window immediately (even mid-search): app unhidden (or
+window unminimized), exact frame restored, exact window raised and
+focused, record and card removed, rail reflowed.
 
-### 2. Keyboard search
+### 2. Keyboard search: `Fn+T`, then letters
 
-1. Press the untuck shortcut (default `Cmd+Shift+T`). Tuck enters a
-   short application-search window (default 1.5s, reset after each
-   letter you type; configurable).
-2. Type letters (A–Z only). Matching is a case-insensitive prefix match
-   against each tucked window's application name:
-   - **S** matches Safari, Slack, and Spotify.
-   - **SA** narrows to Safari.
-   - **V** matches "Visual Studio Code".
-3. As soon as your typed letters match exactly **one** tucked window,
-   it is restored immediately.
-4. If your letters match **more than one** window, every matching
-   card automatically expands to the same larger, emphasized state used
-   by mouse hover, so you can see your options while non-matching cards
-   stay compact. Keep typing to narrow further.
-5. If your letters match **no** window, the search is cancelled, any
-   search-expanded cards collapse back down, and Tuck returns to idle.
+Case-insensitive prefix match on the app name, within the search scope:
 
-Press **Esc** at any point during a search to cancel immediately.
-There is no fuzzy or substring matching in v1 — only case-insensitive
-prefix matching on the application name.
+- **One match** → restored immediately.
+- **Several matches** → all matching cards expand to the hover state so
+  you can tell them apart; non-matching cards stay parked. Keep typing to
+  narrow (`S` → Safari, Slack, Spotify; `SA` → Safari).
+- **No match** → search cancelled, cards collapse.
+- `Esc` or timeout cancels. Every accepted letter restarts the timeout.
+
+Multiple windows of the same app are separate cards and separate
+matches; matching is on the app name, restoring is by window.
+
+If you reveal a tucked window yourself (Dock click, Cmd+Tab, Cmd+H again,
+unminimize), Tuck notices, removes its record and card, and does **not**
+re-hide it.
 
 ## Search scope vs. physical placement
 
@@ -161,23 +176,49 @@ Rails automatically reflow (no gaps, rebalanced stacking) whenever a
 window is tucked, restored (by any method), manually unminimized, or
 destroyed while tucked.
 
-## Cards
+## Cards, shelves and motion
 
-A card can show, each independently toggleable:
+A card shows (each optional) a thumbnail captured at tuck time, the
+app's real icon (from its bundle, never a generic one), the app name, and
+the window title.
 
-- a cached thumbnail of the window (captured once, at the moment of
-  tucking — never re-captured while parked)
-- the application's real macOS icon (via `hs.image.imageFromAppBundle`
-  — never a generic placeholder, never downloaded, never bundled)
-- the application's name
-- the window's title (off by default)
+**Left and right rails peek** (`rails.<edge>.peek`, on by default; top and
+bottom keep the classic fully-visible layout, and you can turn peek on for
+any edge). A card's *size never changes* by parking or revealing, only
+its position across the rail; its position *along* the rail (order) never
+changes either, so neighbours don't jump.
 
-Cards are collapsed by default. Hovering a card, or having it match an
-in-progress keyboard search, expands it to a larger, more detailed
-state; if both conditions are true at once it stays expanded until
-*both* end. Expansion always grows inward, toward the screen, never
-toward or past the opposite screen boundary, and the card's anchor
-point on its rail never moves while it expands.
+| State | When | Visible inside the screen |
+| --- | --- | --- |
+| **Parked** | resting | `card.peekSize` px (default 8) |
+| **Edge reveal** | pointer in the trigger strip | `card.edgeRevealSize` px (default 40) |
+| **Hover / search match** | pointer over the card, or matched by a search | full card, expanded to `expandedWidth × expandedHeight`, anchored at the edge, growing inward, clamped to the screen |
+
+Hover and search expansion coexist: a card that is both stays expanded
+until both end.
+
+**Stable interaction.** No polling: one mouse-moved event tap (running
+only while a peek rail has cards; it never consumes events and clicks are
+never blocked) tests the pointer against each rail's trigger strip
+(`card.edgeTriggerSize` deep, default 64, deeper than the revealed cards;
+spanning only the rail's cards). Each rail reveals while the pointer is in
+its strip or over any of its cards, and retracts only after
+`card.revealGraceDelay` (default 0.18 s) with no pointer, so moving
+between cards or between a card and the strip cannot flicker. Cards grow
+inward, away from the pointer.
+
+**Animation.** One shared, time-based animator (`card/animator.lua`)
+drives every move: progress comes from elapsed time (not step counts), so
+it is frame-rate independent; a new animation replaces the running one and
+continues from the card's *current* on-screen frame; nothing can write
+after it finishes; frames land exactly on target; and the ticker stops
+when nothing is animating. Card layouts are percentage-based, so content
+scales continuously while a card grows. `hs.canvas` has no documented
+native frame tween, so this is driven by an `hs.timer`.
+
+Limitation: a parked card hangs partly outside its screen. If another
+display sits directly beyond that edge, the hidden part can appear on it;
+set `rails.<edge>.peek = false` for such edges.
 
 ## Configuration
 
@@ -186,48 +227,33 @@ omit keeps its default. Example:
 
 ```lua
 spoon.Tuck:configure({
-  shortcuts = {
-    tuck = { mods = { "fn" }, key = "t" },
-    untuck = { mods = { "cmd", "shift" }, key = "t" },
-  },
-  input = {
-    directionTimeout = 1.5,
-    searchTimeout = 1.5,
-  },
+  shortcuts = { tuck = { mods = { "fn" }, key = "t" } },   -- the ONE shortcut
+  input = { commandTimeout = 1.5 },
   card = {
-    showAppIcon = true,
-    showThumbnail = true,
-    showAppName = true,
-    showWindowTitle = false,
-    collapsedWidth = 72,
-    collapsedHeight = 72,
-    expandedWidth = 220,
-    expandedHeight = 160,
-    cornerRadius = 14,
-    opacity = 0.92,
-    edgeInset = 8,
+    showAppIcon = true, showThumbnail = true,
+    showAppName = true, showWindowTitle = false,
+    collapsedWidth = 72, collapsedHeight = 72,
+    expandedWidth = 220, expandedHeight = 160,
+    cornerRadius = 14, opacity = 0.92, edgeInset = 8,
+    peekSize = 8,          -- parked: px visible
+    edgeRevealSize = 40,   -- pointer near edge: px visible
+    edgeTriggerSize = 64,  -- depth of the edge strip that starts the reveal
+    revealGraceDelay = 0.18,
     expansionEnabled = true,
-    animationDuration = 0.12,
   },
   rails = {
-    left = { origin = "center", margin = 12, padding = 10 },
-    right = { origin = "center", margin = 12, padding = 10 },
-    top = { origin = "center", margin = 12, padding = 10 },
-    bottom = { origin = "center", margin = 12, padding = 10 },
+    left   = { origin = "center", margin = 12, padding = 10, peek = true },
+    right  = { origin = "center", margin = 12, padding = 10, peek = true },
+    top    = { origin = "center", margin = 12, padding = 10, peek = false },
+    bottom = { origin = "center", margin = 12, padding = 10, peek = false },
   },
-  screen = {
-    useWorkArea = true, -- false = use the full screen frame, ignoring menu bar/dock
-  },
-  search = {
-    scope = "screenAndSpace", -- or "space"
-  },
+  screen = { useWorkArea = true },
+  search = { scope = "screenAndSpace" },   -- or "space"
   animation = {
-    hoverDuration = 0.12,
-    tuckRestoreDuration = 0.0,
+    hoverDuration = 0.18, revealDuration = 0.22, reflowDuration = 0.20,
+    easing = "easeOutCubic",               -- | "easeInOutCubic" | "linear"
   },
-  logging = {
-    level = "info", -- "debug" | "info" | "warning" | "error"
-  },
+  logging = { level = "info" },
 })
 spoon.Tuck:start()
 ```
@@ -266,14 +292,15 @@ To → All Desktops") are not supported and cannot be tucked. Attempting
 to tuck one leaves the window untouched (not minimized, no card, no
 state created) and shows a brief on-screen notice.
 
-## Manual unminimize behavior
+## Manual reveal behavior
 
-If you manually unminimize a tucked window yourself (clicking its Dock
-icon, `Cmd+Tab`-ing to it, etc.) instead of using a Tuck untuck
-mechanism, Tuck notices via its window-lifecycle tracker and quietly
-removes its own state and card — it does **not** re-minimize the window,
-fight your action, or move/resize it back. Tuck never fights a user's
-manual restoration of a tucked window.
+If you bring a tucked window back yourself (Dock icon, Cmd+Tab, pressing
+Cmd+H again, or unminimizing it), Tuck detects it (application watcher for
+hide/unhide, window filter for minimize), quietly removes its record and
+card, and does **not** re-hide, move, or resize anything. Closing a tucked
+window, or quitting its app, also removes the card. Tuck's own restores
+are told apart from manual ones with explicit guards (per app for
+unhide, per window for unminimize), not with delays.
 
 ## Persistence / restart limitations
 
@@ -292,6 +319,11 @@ need a window back after a restart, just re-tuck it.
 
 - Keyboard search matching is case-insensitive prefix matching only —
   no fuzzy matching, no substring matching, no numeric selectors.
+- Hiding is app-level on macOS; per-window hiding does not exist, hence
+  the hide/minimize split described above. Windows a hidden app opens
+  while it is hidden are outside what Tuck can track.
+- While `Fn` is still held, `T` re-triggers the shortcut instead of
+  searching; release `Fn` before typing `T`.
 - Only standard, single-Space application windows can be tucked
   (`hs.window:isStandard()`); unusual system overlays, transient
   dialogs Hammerspoon itself doesn't consider standard windows, and
@@ -307,31 +339,33 @@ need a window back after a restart, just re-tuck it.
 
 ## Configuration reference
 
-| Path | Type | Default | Notes |
-| --- | --- | --- | --- |
-| `shortcuts.tuck` | `{mods, key}` | `{mods={"fn"}, key="t"}` | |
-| `shortcuts.untuck` | `{mods, key}` | `{mods={"cmd","shift"}, key="t"}` | |
-| `input.directionTimeout` | number (seconds) | `1.5` | |
-| `input.searchTimeout` | number (seconds) | `1.5` | resets on each accepted letter |
-| `card.showAppIcon` | boolean | `true` | |
-| `card.showThumbnail` | boolean | `true` | permission-gated; see above |
-| `card.showAppName` | boolean | `true` | |
-| `card.showWindowTitle` | boolean | `false` | |
-| `card.collapsedWidth`/`collapsedHeight` | number | `72`/`72` | |
-| `card.expandedWidth`/`expandedHeight` | number | `220`/`160` | must be ≥ collapsed |
-| `card.cornerRadius` | number | `14` | |
-| `card.opacity` | number 0–1 | `0.92` | |
-| `card.edgeInset` | number | `8` | distance from screen/work-area edge |
-| `card.expansionEnabled` | boolean | `true` | disable hover/search expansion entirely |
-| `card.animationDuration` | number (seconds) | `0.12` | `0` disables animation |
-| `rails.<edge>.origin` | `"center"\|"start"\|"end"` | `"center"` | per left/right/top/bottom |
-| `rails.<edge>.margin` | number | `12` | |
-| `rails.<edge>.padding` | number | `10` | |
-| `screen.useWorkArea` | boolean | `true` | `false` = full screen frame |
-| `search.scope` | `"screenAndSpace"\|"space"` | `"screenAndSpace"` | |
-| `animation.hoverDuration` | number | `0.12` | |
-| `animation.tuckRestoreDuration` | number | `0.0` | |
-| `logging.level` | `"debug"\|"info"\|"warning"\|"error"` | `"info"` | |
+| Path | Default | Notes |
+| --- | --- | --- |
+| `shortcuts.tuck` | `{mods={"fn"}, key="t"}` | the only shortcut |
+| `input.commandTimeout` | `1.5` | seconds; restarts after each accepted letter |
+| `card.showAppIcon` / `showThumbnail` / `showAppName` / `showWindowTitle` | `true`/`true`/`true`/`false` | |
+| `card.collapsedWidth` / `collapsedHeight` | `72` / `72` | card size (never changed by parking/reveal) |
+| `card.expandedWidth` / `expandedHeight` | `220` / `160` | hover / search size; ≥ collapsed |
+| `card.cornerRadius`, `card.opacity` | `14`, `0.92` | |
+| `card.edgeInset` | `8` | gap from the edge on non-peek rails |
+| `card.peekSize` | `8` | px visible when parked (peek rails) |
+| `card.edgeRevealSize` | `40` | px visible during edge reveal; ≥ peekSize, ≤ card size |
+| `card.edgeTriggerSize` | `64` | depth of the trigger strip; ≥ peekSize (keep > edgeRevealSize) |
+| `card.revealGraceDelay` | `0.18` | seconds before a rail retracts |
+| `card.expansionEnabled` | `true` | disables hover/search expansion |
+| `rails.<edge>.origin` | `"center"` | `"center"`, `"start"`, `"end"` |
+| `rails.<edge>.margin` / `padding` | `12` / `10` | rail-end margin; gap between cards |
+| `rails.<edge>.peek` | left/right `true`, top/bottom `false` | park mostly off-screen |
+| `screen.useWorkArea` | `true` | `false` = full frame |
+| `search.scope` | `"screenAndSpace"` | or `"space"` (all screens of the current Space) |
+| `animation.hoverDuration` / `revealDuration` / `reflowDuration` | `0.18` / `0.22` / `0.20` | seconds; `0` = instant |
+| `animation.easing` | `"easeOutCubic"` | or `"easeInOutCubic"`, `"linear"` |
+| `logging.level` | `"info"` | |
+
+**Migration.** Old keys are translated automatically: `shortcuts.untuck`
+is ignored (there is one shortcut now), `input.directionTimeout` /
+`input.searchTimeout` → `input.commandTimeout`, `card.animationDuration` →
+`animation.hoverDuration`.
 
 ## Architecture
 
@@ -341,16 +375,17 @@ Tuck.spoon/
   config/defaults.lua      -- default config + validation (pure Lua)
   input/
     shortcut.lua           -- hs.hotkey / hs.eventtap abstraction (Fn support)
-    state.lua              -- direction-selection & app-search state machine (pure Lua)
+    state.lua              -- single command state machine: arrow = tuck, letters = search (pure Lua)
     matcher.lua             -- case-insensitive prefix matching (pure Lua)
   window/
-    manager.lua             -- capture/tuck/restore/forget, eligibility, All-Spaces
-    tracker.lua              -- hs.window.filter sensor (minimized/unminimized/destroyed)
+    manager.lua             -- capture/tuck/restore/forget, hide-vs-minimize choice, All-Spaces
+    tracker.lua              -- window filter (minimize/destroy) + application watcher (hide/unhide/quit)
   space/
     manager.lua              -- current Space/screen resolution, watchers
     geometry.lua              -- pure rail-stacking + expansion math
   card/
-    manager.lua                -- canvas lifecycle, hover/search-expand, click handling
+    manager.lua                -- canvases, parked/reveal/hover states, pointer model, click
+    animator.lua                -- shared time-based frame animator
     renderer.lua                -- builds a card's drawn elements from a TuckedWindow
     preview.lua                  -- Screen Recording permission + snapshot capture
     icon.lua                      -- native app icon cache
@@ -377,59 +412,53 @@ the source):
    `WindowManager:restore()`.
 5. Physical shelf placement and keyboard search scope are independent
    concepts; changing one never changes the other.
-6. The real application window always stays under ordinary macOS
-   minimized-window management — Tuck never emulates minimizing with
-   frame tricks, moves a window off-screen, or resizes it.
+6. The real window is only ever hidden or minimized through the normal
+   macOS mechanisms — never emulated with frame tricks, moved
+   off-screen, or resized.
 7. Tuck never fights a user's manual restoration of a tucked window.
+8. A hide-tucked window is the only tuck record of its application.
 
 ## Testing
 
-### Automated (pure Lua, no Hammerspoon required)
+### Automated (no Hammerspoon required)
 
 ```
 cd Tuck.spoon
 lua5.4 tests/run_tests.lua
 ```
 
-This runs, entirely outside of Hammerspoon:
+Specs: `config_defaults_spec` (schema, validation, migration),
+`geometry_spec` (stacking, depth/peek positions, expansion anchoring and
+clamping, trigger strips, negative-coordinate screens), `store_spec`,
+`input_state_spec` (shared shortcut; arrows tuck, letters search, arrows
+never restore, Esc/timeout, narrowing, timer restarts), `matcher_spec`,
+`shortcut_flags_spec`, `animator_spec` (exact landing, monotonic and
+time-based progress, replacement continuity, no late writes, no timer
+leak, easing), and `integration_spec` (the real `init.lua` against
+`tests/mock_hs.lua`: hide vs minimize, exact-window restore and focus,
+same-app independence across screens/Spaces, manual unhide/unminimize,
+destroy and app quit, All-Spaces rejection, search scopes, parked/reveal/
+hover states on every edge, grace-delay stability, rapid hover, idempotent
+start/stop and no leaked taps/timers/watchers).
 
-- `config_defaults_spec` — configuration merge + validation
-- `geometry_spec` — rail-stacking and expansion math (center/start/end
-  origin, negative-coordinate screens, reflow-without-gaps, expansion
-  clamping)
-- `store_spec` — the TuckState windows/shelves indexes (multiple
-  windows per app, multiple screens/Spaces, idempotent removal)
-- `input_state_spec` — the direction-selection and app-search state
-  machine (every transition in the spec, including timeouts, Esc, and
-  zero/one/many-match search outcomes)
-- `matcher_spec` — case-insensitive prefix matching
-- `shortcut_flags_spec` — exact-match logic for Fn-based shortcuts
-- `integration_spec` — the **real** `init.lua`, loaded against a mock
-  `hs` implementation (`tests/mock_hs.lua`), exercising full tuck →
-  restore cycles, Esc/timeout cancellation, keyboard search (unique,
-  multiple-match, zero-match), manual-unminimize detection, window
-  destruction cleanup, All-Spaces rejection, multiple-windows-per-app
-  independence, and start/stop idempotency
-
-As of this writing the suite reports **225 assertions, 0 failures**
-across all 7 spec files.
-
-The mock `hs` module is deliberately narrow: it mirrors the
-**documented signatures** of the Hammerspoon APIs Tuck uses, not real
-macOS behavior, which cannot be reproduced outside of Hammerspoon
-itself. Treat a passing test suite as "the wiring between modules is
-sound," not as "this has been validated on macOS."
+The mock mirrors documented API signatures, not macOS behavior. Passing
+tests mean the logic and wiring are sound; they do **not** show that the
+motion looks smooth or that macOS behaves as assumed. Do the manual
+checklist below.
 
 ### Manual, OS-level validation checklist
 
 The following can only be verified by running Tuck inside real
 Hammerspoon on macOS:
 
-**Basic tuck**
-- [ ] Tuck a normal app window left/right/top/bottom
-- [ ] Confirm the real window is minimized (visible in Mission Control /
-  Dock as minimized)
-- [ ] Confirm it is not moved off-screen and not resized
+**Basic tuck / hiding**
+- [x] `Fn+T` then each arrow tucks to the right rail
+- [x] Single-window app (e.g. VS Code): app hides like Cmd+H
+- [ ] Safari with several windows: only the chosen window disappears
+  (minimized); the others stay visible
+- [ ] Terminal/iTerm2 with several windows behaves the same
+- [ ] Window is not moved off-screen and not resized
+- [ ] `Fn+T` then letters never tucks; `Fn+T` then an arrow never restores
 
 **Restore**
 - [ ] Restore by clicking a card
@@ -473,7 +502,8 @@ Hammerspoon on macOS:
 - [ ] A window assigned to All Spaces cannot be tucked, and Tuck says so
 
 **Lifecycle**
-- [ ] Manually unminimizing a tucked window removes its card
+- [ ] Manually unhiding (Dock, Cmd+Tab, Cmd+H) or unminimizing a tucked
+  window removes its card and does not re-hide it
 - [ ] Destroying (closing) a tucked window removes its state and card
 - [ ] Quitting the application behind a tucked window removes its card
 - [ ] Repeated `:start()`/`:stop()` is safe (no duplicate shortcuts,
@@ -486,6 +516,17 @@ Hammerspoon on macOS:
   tucking still works normally
 - [ ] Revoking Accessibility mid-session degrades gracefully (Tuck logs
   and shows feedback rather than crashing)
+
+**Card motion (look at it!)**
+- [ ] Parked left/right cards show only a small sliver
+- [ ] Approaching the edge slides cards smoothly to the reveal depth
+- [ ] Hovering a card expands it inward, smoothly, with no flicker
+- [ ] Rapid in/out and card-to-card movement stay smooth, no oscillation
+- [ ] Moving the pointer along the strip and away retracts once, after
+  a short delay
+- [ ] Search-matched cards expand with the same motion
+- [ ] Rapid repeated tuck / untuck leaves no stale cards or hidden apps
+- [ ] Clicking near the screen edge (scrollbars) still works
 
 **UI**
 - [ ] Collapsed vs. hover-expanded vs. search-expanded card appearance

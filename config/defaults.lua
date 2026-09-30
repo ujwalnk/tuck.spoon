@@ -15,13 +15,15 @@ M.defaults = {
     -- Table form: {mods = {"fn"}, key = "t"} so that Fn (which is not a
     -- normal hs.hotkey modifier) can be expressed uniformly. `mods` may
     -- contain any of: "cmd", "alt", "shift", "ctrl", "fn".
+    -- ONE shortcut for everything: press it, then an arrow key to tuck
+    -- the focused window, or letters to search tucked apps and restore.
     tuck = { mods = { "fn" }, key = "t" },
-    untuck = { mods = { "cmd", "shift" }, key = "t" },
   },
 
   input = {
-    directionTimeout = 1.5, -- seconds
-    searchTimeout = 1.5, -- seconds
+    -- Seconds the command mode waits for input after the shortcut. It
+    -- also restarts after every accepted search letter.
+    commandTimeout = 1.5,
   },
 
   card = {
@@ -37,19 +39,36 @@ M.defaults = {
 
     cornerRadius = 14,
     opacity = 0.92,
-    -- Distance from the screen/work-area edge to the card's outer edge.
+    -- Distance from the screen/work-area edge to the card's outer edge
+    -- when a rail is NOT peeking (rails.<edge>.peek = false).
     edgeInset = 8,
+
+    -- The three resting depths of a peeking rail (left/right by
+    -- default). Each is "how many pixels of the card are visible inside
+    -- the screen"; the card itself is never resized by these:
+    --   peekSize        parked: only this much shows (edge hint)
+    --   edgeRevealSize  pointer near the edge: this much shows
+    -- and hovering/search-matching a card expands it fully
+    -- (expandedWidth/expandedHeight).
+    peekSize = 8,
+    edgeRevealSize = 40,
+    -- Thickness (px) of the invisible strip along a peeking edge that
+    -- detects the pointer approaching. Must be >= peekSize.
+    edgeTriggerSize = 64,
+    -- Seconds the pointer may be away from a rail's cards/strip before
+    -- the rail retracts. Prevents flicker while moving between cards.
+    revealGraceDelay = 0.18,
 
     -- Whether hover/search expansion is enabled at all.
     expansionEnabled = true,
-    animationDuration = 0.12,
   },
 
   rails = {
-    left = { origin = "center", margin = 12, padding = 10 },
-    right = { origin = "center", margin = 12, padding = 10 },
-    top = { origin = "center", margin = 12, padding = 10 },
-    bottom = { origin = "center", margin = 12, padding = 10 },
+    -- peek = true: cards sit mostly off-screen, reveal on approach.
+    left = { origin = "center", margin = 12, padding = 10, peek = true },
+    right = { origin = "center", margin = 12, padding = 10, peek = true },
+    top = { origin = "center", margin = 12, padding = 10, peek = false },
+    bottom = { origin = "center", margin = 12, padding = 10, peek = false },
   },
 
   screen = {
@@ -63,8 +82,11 @@ M.defaults = {
   },
 
   animation = {
-    hoverDuration = 0.12,
-    tuckRestoreDuration = 0.0, -- 0 disables (no documented HS window animation is required)
+    hoverDuration = 0.18, -- expand/collapse of a hovered or search-matched card
+    revealDuration = 0.22, -- park <-> edge-reveal slide
+    reflowDuration = 0.20, -- neighbours closing a gap / new card settling
+    -- "easeOutCubic" | "easeInOutCubic" | "linear"
+    easing = "easeOutCubic",
   },
 
   logging = {
@@ -91,17 +113,51 @@ local function deepcopy(value)
 end
 M.deepcopy = deepcopy
 
+--- Translate configuration keys from earlier releases into the current
+-- schema (on a copy; the caller's table is never modified).
+--   shortcuts.untuck            -> removed (one shared shortcut now)
+--   input.directionTimeout /
+--   input.searchTimeout         -> input.commandTimeout
+--   card.animationDuration      -> animation.hoverDuration
+function M.migrate(overrides)
+  if type(overrides) ~= "table" then
+    return overrides
+  end
+  local out = deepcopy(overrides)
+  if type(out.shortcuts) == "table" then
+    out.shortcuts.untuck = nil
+  end
+  if type(out.input) == "table" then
+    if out.input.commandTimeout == nil then
+      out.input.commandTimeout = out.input.directionTimeout or out.input.searchTimeout
+    end
+    out.input.directionTimeout = nil
+    out.input.searchTimeout = nil
+  end
+  if type(out.card) == "table" and out.card.animationDuration ~= nil then
+    out.animation = out.animation or {}
+    if out.animation.hoverDuration == nil then
+      out.animation.hoverDuration = out.card.animationDuration
+    end
+    out.card.animationDuration = nil
+  end
+  return out
+end
+
 --- Shallow-merge (recursively for nested tables) `overrides` onto a copy of
 -- `base`. Unknown top-level keys in `overrides` are copied through as-is so
 -- callers get a clear validation error rather than silent loss.
-local function mergeConfig(base, overrides)
+local function mergeConfig(base, overrides, skipMigration)
+  if not skipMigration then
+    overrides = M.migrate(overrides)
+  end
   local out = deepcopy(base)
   if overrides == nil then
     return out
   end
   for key, value in pairs(overrides) do
     if type(value) == "table" and type(out[key]) == "table" then
-      out[key] = mergeConfig(out[key], value)
+      out[key] = mergeConfig(out[key], value, true)
     else
       out[key] = deepcopy(value)
     end
@@ -145,19 +201,12 @@ function M.validate(cfg)
   if not ok then
     return false, err
   end
-  ok, err = validateShortcut("untuck", cfg.shortcuts.untuck)
-  if not ok then
-    return false, err
-  end
 
   if type(cfg.input) ~= "table" then
     return false, "configuration.input must be a table"
   end
-  if type(cfg.input.directionTimeout) ~= "number" or cfg.input.directionTimeout <= 0 then
-    return false, "configuration.input.directionTimeout must be a positive number"
-  end
-  if type(cfg.input.searchTimeout) ~= "number" or cfg.input.searchTimeout <= 0 then
-    return false, "configuration.input.searchTimeout must be a positive number"
+  if type(cfg.input.commandTimeout) ~= "number" or cfg.input.commandTimeout <= 0 then
+    return false, "configuration.input.commandTimeout must be a positive number"
   end
 
   if type(cfg.card) ~= "table" then
@@ -180,8 +229,19 @@ function M.validate(cfg)
   if type(cfg.card.edgeInset) ~= "number" or cfg.card.edgeInset < 0 then
     return false, "configuration.card.edgeInset must be a non-negative number"
   end
-  if type(cfg.card.animationDuration) ~= "number" or cfg.card.animationDuration < 0 then
-    return false, "configuration.card.animationDuration must be a non-negative number"
+  for _, k in ipairs({ "peekSize", "edgeRevealSize", "edgeTriggerSize", "revealGraceDelay" }) do
+    if type(cfg.card[k]) ~= "number" or cfg.card[k] < 0 then
+      return false, "configuration.card." .. k .. " must be a non-negative number"
+    end
+  end
+  if cfg.card.edgeRevealSize < cfg.card.peekSize then
+    return false, "configuration.card.edgeRevealSize must be >= peekSize"
+  end
+  if cfg.card.edgeTriggerSize < cfg.card.peekSize then
+    return false, "configuration.card.edgeTriggerSize must be >= peekSize"
+  end
+  if cfg.card.edgeRevealSize > cfg.card.collapsedWidth or cfg.card.edgeRevealSize > cfg.card.collapsedHeight then
+    return false, "configuration.card.edgeRevealSize must not exceed the collapsed card size"
   end
 
   if type(cfg.rails) ~= "table" then
@@ -201,6 +261,9 @@ function M.validate(cfg)
     if type(rail.padding) ~= "number" or rail.padding < 0 then
       return false, "configuration.rails." .. edge .. ".padding must be a non-negative number"
     end
+    if type(rail.peek) ~= "boolean" then
+      return false, "configuration.rails." .. edge .. ".peek must be a boolean"
+    end
   end
 
   if type(cfg.screen) ~= "table" or type(cfg.screen.useWorkArea) ~= "boolean" then
@@ -214,11 +277,13 @@ function M.validate(cfg)
   if type(cfg.animation) ~= "table" then
     return false, "configuration.animation must be a table"
   end
-  if type(cfg.animation.hoverDuration) ~= "number" or cfg.animation.hoverDuration < 0 then
-    return false, "configuration.animation.hoverDuration must be a non-negative number"
+  for _, k in ipairs({ "hoverDuration", "revealDuration", "reflowDuration" }) do
+    if type(cfg.animation[k]) ~= "number" or cfg.animation[k] < 0 then
+      return false, "configuration.animation." .. k .. " must be a non-negative number"
+    end
   end
-  if type(cfg.animation.tuckRestoreDuration) ~= "number" or cfg.animation.tuckRestoreDuration < 0 then
-    return false, "configuration.animation.tuckRestoreDuration must be a non-negative number"
+  if cfg.animation.easing ~= "easeOutCubic" and cfg.animation.easing ~= "easeInOutCubic" and cfg.animation.easing ~= "linear" then
+    return false, "configuration.animation.easing must be one of easeOutCubic|easeInOutCubic|linear"
   end
 
   if type(cfg.logging) ~= "table" or not VALID_LOG_LEVELS[cfg.logging.level] then

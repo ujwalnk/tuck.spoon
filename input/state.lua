@@ -1,28 +1,34 @@
 --- Input state machine.
 --
--- States: idle -> waitingForDirection -> idle
---         idle -> waitingForAppLetter -> idle
+-- One shared shortcut opens ONE command state:
 --
--- This module is intentionally free of timers/hotkeys/Hammerspoon: the
--- caller (input/shortcut.lua + init.lua) owns the actual timer objects and
--- calls into this state machine's pure transition functions, then acts on
--- the returned instruction. This split is what allows the state machine
--- itself to be unit tested deterministically (no real clocks).
+--   idle --shortcut--> waitingForCommand
 --
--- Every public method returns a table describing what the caller should do,
--- e.g. { action = "tuck", edge = "left" } or { action = "restore", tuckID = "x" }
--- or { action = "none" }. The state machine never calls into Hammerspoon or
--- any card/window API directly.
+--   waitingForCommand:
+--     arrow (no search typed yet)  -> tuck focused window toward that edge, idle
+--     A-Z                          -> start / narrow the tucked-app search
+--                                     (1 match: restore + idle,
+--                                      >1: keep waiting, 0: cancel + idle)
+--     Esc / timeout                -> cancel, idle
+--
+-- Once a search letter has been accepted the command is a search:
+-- arrows are ignored from then on (they never restore anything, and
+-- they must not tuck a window in the middle of choosing one to restore).
+--
+-- The module has no timers, hotkeys or Hammerspoon dependency; the caller
+-- owns the timer and acts on the returned instruction table, e.g.
+--   { action = "tuck", edge = "left" }, { action = "restore", tuckID = ... },
+--   { action = "restartCommandTimer", matches = {...} }, { action = "cancel" }.
 
 local StateMachine = {}
 StateMachine.__index = StateMachine
 
-local VALID_EDGES = { Left = "left", Right = "right", Up = "top", Down = "bottom" }
+local ARROW_EDGES = { Left = "left", Right = "right", Up = "top", Down = "bottom" }
 
 function StateMachine.new()
   local self = setmetatable({}, StateMachine)
   self.state = "idle"
-  self.search = nil -- { query, scope, candidates, matches }
+  self.search = nil -- { query, matches } while in waitingForCommand
   return self
 end
 
@@ -30,36 +36,26 @@ function StateMachine:current()
   return self.state
 end
 
---- Called when the configured tuck shortcut fires.
-function StateMachine:tuckShortcutPressed()
-  if self.state ~= "idle" then
-    -- Re-entering direction mode from any other state simply resets to a
-    -- fresh direction wait; we never stack modes.
-    self:reset()
-  end
-  self.state = "waitingForDirection"
-  return { action = "startDirectionTimer" }
+--- The single shortcut was pressed. Always (re)enters a fresh command.
+function StateMachine:commandShortcutPressed()
+  self:reset()
+  self.state = "waitingForCommand"
+  self.search = { query = "", matches = {} }
+  return { action = "startCommandTimer" }
 end
 
---- Called when the configured untuck shortcut fires.
-function StateMachine:untuckShortcutPressed(scope)
-  if self.state ~= "idle" then
-    self:reset()
-  end
-  self.state = "waitingForAppLetter"
-  self.search = { query = "", scope = scope, candidates = {}, matches = {} }
-  return { action = "startSearchTimer" }
+--- True once at least one search letter has been accepted.
+function StateMachine:isSearching()
+  return self.state == "waitingForCommand" and self.search ~= nil and #self.search.query > 0
 end
 
---- Arrow key pressed while in waitingForDirection. `arrowName` is one of
--- "Left", "Right", "Up", "Down" (matching hs.keycodes naming).
--- Returns { action = "tuck", edge = ... } or { action = "none" } if not
--- applicable in the current state.
+--- Arrow key ("Left"|"Right"|"Up"|"Down"). Tucks only while no search
+-- letter has been typed; never restores anything.
 function StateMachine:arrowPressed(arrowName)
-  if self.state ~= "waitingForDirection" then
+  if self.state ~= "waitingForCommand" or self:isSearching() then
     return { action = "none" }
   end
-  local edge = VALID_EDGES[arrowName]
+  local edge = ARROW_EDGES[arrowName]
   if not edge then
     return { action = "none" }
   end
@@ -67,41 +63,30 @@ function StateMachine:arrowPressed(arrowName)
   return { action = "tuck", edge = edge }
 end
 
---- Esc pressed. Valid from either waiting state; cancels immediately.
+--- Esc: cancel immediately from the command state.
 function StateMachine:escPressed()
   if self.state == "idle" then
     return { action = "none" }
   end
-  local wasSearching = self.state == "waitingForAppLetter"
+  local wasSearching = self:isSearching()
   self:reset()
   return { action = "cancel", collapseSearch = wasSearching }
 end
 
---- Timer fired for whichever mode is currently active. Cancels back to
--- idle without modifying anything.
+--- Command timeout elapsed.
 function StateMachine:timeoutFired()
   if self.state == "idle" then
     return { action = "none" }
   end
-  local wasSearching = self.state == "waitingForAppLetter"
+  local wasSearching = self:isSearching()
   self:reset()
   return { action = "cancel", collapseSearch = wasSearching }
 end
 
---- A-Z letter typed while in waitingForAppLetter. `letter` is a single
--- upper-case character. `matchFn(query) -> candidateList` is supplied by
--- the caller (it queries the real card/window registry); this keeps the
--- state machine itself free of any data dependency.
---
--- matchFn should return an array of { tuckID = ..., appName = ... }.
---
--- Returns one of:
---   { action = "restartSearchTimer" }                          -- 2+ matches, keep waiting
---   { action = "restore", tuckID = ... , collapseSearch = true } -- exactly 1 match
---   { action = "cancel", collapseSearch = true }                 -- 0 matches
---   { action = "none" }                                          -- wrong state / invalid letter
+--- A-Z typed. `matchFn(query)` returns the array of matches
+-- ({ tuckID =, appName = }) for the accumulated upper-case query.
 function StateMachine:letterPressed(letter, matchFn)
-  if self.state ~= "waitingForAppLetter" then
+  if self.state ~= "waitingForCommand" then
     return { action = "none" }
   end
   if type(letter) ~= "string" or #letter ~= 1 or not letter:match("^[A-Za-z]$") then
@@ -119,31 +104,24 @@ function StateMachine:letterPressed(letter, matchFn)
     local tuckID = matches[1].tuckID
     self:reset()
     return { action = "restore", tuckID = tuckID, collapseSearch = true }
-  else
-    return { action = "restartSearchTimer", matches = matches }
   end
+  return { action = "restartCommandTimer", matches = matches }
 end
 
---- A card was clicked directly (bypassing keyboard search). Valid in any
--- state; always restores immediately and cancels any active search.
+--- A card was clicked: restore it immediately from any state, cancelling
+-- any command in progress.
 function StateMachine:cardClicked(tuckID)
-  local wasSearching = self.state == "waitingForAppLetter"
+  local wasActive = self.state ~= "idle"
   self:reset()
-  return { action = "restore", tuckID = tuckID, collapseSearch = wasSearching }
+  return { action = "restore", tuckID = tuckID, collapseSearch = wasActive }
 end
 
 function StateMachine:currentQuery()
-  if self.search then
-    return self.search.query
-  end
-  return nil
+  return self.search and self.search.query or nil
 end
 
 function StateMachine:currentMatches()
-  if self.search then
-    return self.search.matches
-  end
-  return {}
+  return self.search and self.search.matches or {}
 end
 
 function StateMachine:reset()

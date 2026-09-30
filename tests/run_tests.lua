@@ -25,6 +25,7 @@ local suites = {
   { name = "input_state_spec", fn = require("tests.input_state_spec") },
   { name = "matcher_spec", fn = require("tests.matcher_spec") },
   { name = "shortcut_flags_spec", fn = require("tests.shortcut_flags_spec") },
+  { name = "animator_spec", fn = require("tests.animator_spec") },
   { name = "integration_spec", fn = require("tests.integration_spec") },
 }
 

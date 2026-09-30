@@ -20,6 +20,9 @@ local M = {}
 --   inset      - distance from the card's outer edge to the screen boundary
 --                perpendicular to the rail (e.g. how far a left-rail card
 --                sits from the left edge of the screen)
+--   depth      - optional. Overrides `inset`: how many pixels the card
+--                extends past the boundary into the usable area (see
+--                below). Enables the parked / edge-reveal positions.
 --
 -- Returns a frame {x, y, w, h} for the requested index.
 function M.frameForIndex(params)
@@ -67,10 +70,27 @@ function M.frameForIndex(params)
 
   local alongOffset = startOffset + (index - 1) * (itemAlong + padding)
 
-  -- Position across the rail axis (perpendicular): flush against the
-  -- screen/work-area boundary for that edge, offset inward by `inset`.
+  -- Position across the rail axis (perpendicular).
+  --
+  -- Two equivalent ways to express it:
+  --   * `inset` (default, "fully visible"): the card sits entirely
+  --     inside the boundary, `inset` pixels away from it.
+  --   * `depth` (optional override): how far the card's INNER edge
+  --     extends past the boundary into the usable area. depth < item
+  --     size means only `depth` pixels of the card are visible and the
+  --     rest hangs outside the boundary (the "parked"/"edge reveal"
+  --     states). depth == itemAcross + inset reproduces the inset form.
   local acrossOffset
-  if edge == "left" then
+  if params.depth ~= nil then
+    local depth = params.depth
+    if edge == "left" or edge == "top" then
+      acrossOffset = depth - itemAcross
+    elseif edge == "right" then
+      acrossOffset = area.w - depth
+    else -- bottom
+      acrossOffset = area.h - depth
+    end
+  elseif edge == "left" then
     acrossOffset = inset
   elseif edge == "right" then
     acrossOffset = area.w - inset - itemAcross
@@ -177,6 +197,23 @@ function M.expandedFrame(collapsed, edge, expandedSize, area)
   end
 
   return frame
+end
+
+--- Frame of the invisible edge-trigger strip for a rail: a thin band
+-- along the whole boundary of `edge` that detects the pointer
+-- approaching the edge (used to start the "edge reveal" state without
+-- polling the mouse position).
+--   area  - {x,y,w,h}; edge; size - strip thickness perpendicular to the edge
+function M.triggerZoneFrame(area, edge, size)
+  assert(area and edge and size)
+  if edge == "left" then
+    return { x = area.x, y = area.y, w = size, h = area.h }
+  elseif edge == "right" then
+    return { x = area.x + area.w - size, y = area.y, w = size, h = area.h }
+  elseif edge == "top" then
+    return { x = area.x, y = area.y, w = area.w, h = size }
+  end
+  return { x = area.x, y = area.y + area.h - size, w = area.w, h = size }
 end
 
 return M

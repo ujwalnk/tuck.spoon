@@ -33,6 +33,14 @@ function Tracker.new(hsRef, logger)
   self.onMoved = nil
   self.onTitleChanged = nil
 
+  -- Application-level callbacks, each `function(app, appName)`. Hiding
+  -- (Cmd+H) is an application-wide state, so it is observed with
+  -- hs.application.watcher rather than hs.window.filter.
+  self.onAppHidden = nil
+  self.onAppUnhidden = nil
+  self.onAppTerminated = nil
+  self.appWatcher = nil
+
   return self
 end
 
@@ -101,10 +109,61 @@ function Tracker:start()
       end
     end)
   end)
+
+  self:_startAppWatcher()
+end
+
+--- Every window the filter currently knows about, across ALL Spaces
+-- (hs.window:allWindows()/application:allWindows() only see the current
+-- Space). Returns nil if unavailable.
+function Tracker:allWindows()
+  if not self.wf then
+    return nil
+  end
+  local ok, list = pcall(function()
+    return self.wf:getWindows()
+  end)
+  if ok and type(list) == "table" then
+    return list
+  end
+  return nil
+end
+
+--- Start the application watcher (hidden / unhidden / terminated).
+function Tracker:_startAppWatcher()
+  local hs = self.hs
+  local this = self
+  local ok, watcher = pcall(function()
+    return hs.application.watcher.new(function(appName, eventType, app)
+      local handler
+      if eventType == hs.application.watcher.hidden then
+        handler = this.onAppHidden
+      elseif eventType == hs.application.watcher.unhidden then
+        handler = this.onAppUnhidden
+      elseif eventType == hs.application.watcher.terminated then
+        handler = this.onAppTerminated
+      end
+      if handler then
+        safeCall(this.logger, "application:" .. tostring(eventType), handler, app, appName)
+      end
+    end)
+  end)
+  if ok and watcher then
+    self.appWatcher = watcher
+    self.appWatcher:start()
+  elseif self.logger then
+    self.logger.e("Tuck: failed to create hs.application.watcher: " .. tostring(watcher))
+  end
 end
 
 --- Stop tracking and release the window filter. Idempotent.
 function Tracker:stop()
+  if self.appWatcher then
+    pcall(function()
+      self.appWatcher:stop()
+    end)
+    self.appWatcher = nil
+  end
   if self.wf then
     local ok, err = pcall(function()
       self.wf:unsubscribeAll()

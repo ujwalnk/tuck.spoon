@@ -205,6 +205,67 @@ local function run()
     t.isTrue(expanded.x + expanded.w <= area.x + area.w, "top expansion clamped within area horizontally (right)")
   end
 
+  -- Depth-based positioning (parked / edge-reveal states).
+  do
+    local area = { x = 0, y = 0, w = 1440, h = 900 }
+    local function frame(edge, depth, extra)
+      local p = { area = area, edge = edge, itemSize = { w = 72, h = 72 }, margin = 12, padding = 10,
+        origin = "start", inset = 8, index = 1, count = 1, depth = depth }
+      for k, v in pairs(extra or {}) do p[k] = v end
+      return geometry.frameForIndex(p)
+    end
+    -- Left: peek of 8px => only 8px of the 72px card is inside the screen.
+    local left = frame("left", 8)
+    t.eq(left.x, 8 - 72, "left parked: card hangs outside the left boundary")
+    t.eq(left.x + left.w, 8, "left parked: exactly peek pixels visible")
+    t.eq(left.w, 72, "parking never resizes the card")
+    -- Right
+    local right = frame("right", 8)
+    t.eq(right.x, 1440 - 8, "right parked: only peek pixels inside")
+    t.eq(right.w, 72)
+    -- Edge reveal shows more, along-axis position identical.
+    local leftReveal = frame("left", 40)
+    t.eq(leftReveal.x + leftReveal.w, 40, "edge reveal exposes 40px")
+    t.eq(leftReveal.y, left.y, "order/along position stable across depth states")
+    -- depth == itemAcross + inset reproduces the classic inset frame.
+    local classic = frame("left", nil)
+    local viaDepth = frame("left", 72 + 8)
+    t.eq(viaDepth.x, classic.x, "depth=size+inset matches inset form (left)")
+    local classicR = frame("right", nil)
+    local viaDepthR = frame("right", 72 + 8)
+    t.eq(viaDepthR.x, classicR.x, "depth=size+inset matches inset form (right)")
+    local classicB = frame("bottom", nil)
+    local viaDepthB = frame("bottom", 72 + 8)
+    t.eq(viaDepthB.y, classicB.y, "depth=size+inset matches inset form (bottom)")
+    -- Negative-origin screen still respected for parked cards.
+    local neg = geometry.frameForIndex({ area = { x = -1920, y = 0, w = 1920, h = 1080 }, edge = "right",
+      itemSize = { w = 72, h = 72 }, index = 1, count = 1, depth = 8, origin = "start" })
+    t.eq(neg.x, -1920 + 1920 - 8, "right parked on negative-coordinate screen")
+  end
+
+  -- Expansion anchors on the full-depth frame, growing inward and staying in bounds.
+  do
+    local area = { x = 0, y = 0, w = 1440, h = 900 }
+    local full = geometry.frameForIndex({ area = area, edge = "left", itemSize = { w = 72, h = 72 },
+      origin = "start", margin = 12, inset = 8, index = 1, count = 1 })
+    local exp = geometry.expandedFrame(full, "left", { w = 220, h = 160 }, area)
+    t.isTrue(exp.x >= area.x and exp.y >= area.y, "expanded card stays inside the usable area")
+    t.eq(exp.x, full.x, "left expansion anchored at boundary-relative full frame")
+  end
+
+  -- Trigger zone strips.
+  do
+    local area = { x = 100, y = 50, w = 1000, h = 800 }
+    local l = geometry.triggerZoneFrame(area, "left", 6)
+    t.eq(l.x, 100); t.eq(l.w, 6); t.eq(l.h, 800)
+    local r = geometry.triggerZoneFrame(area, "right", 6)
+    t.eq(r.x, 1094); t.eq(r.w, 6)
+    local tp = geometry.triggerZoneFrame(area, "top", 6)
+    t.eq(tp.y, 50); t.eq(tp.h, 6)
+    local b = geometry.triggerZoneFrame(area, "bottom", 6)
+    t.eq(b.y, 844)
+  end
+
   t.report("geometry_spec")
   return #t.failures == 0
 end

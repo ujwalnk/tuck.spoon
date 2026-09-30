@@ -36,7 +36,11 @@ M.logger = {
 -- test can fire it explicitly (no real event loop here).
 -- ------------------------------------------------------------------
 M._pendingTimers = {}
+M._now = 1000
 M.timer = {
+  secondsSinceEpoch = function()
+    return M._now
+  end,
   doAfter = function(seconds, fn)
     local handle = { fn = fn, seconds = seconds, stopped = false }
     table.insert(M._pendingTimers, handle)
@@ -47,12 +51,9 @@ M.timer = {
     }
   end,
   doEvery = function(seconds, fn)
-    -- Real hs.timer.doEvery fires asynchronously, so by the time the
-    -- callback runs, the caller's own `timer = hs.timer.doEvery(...)`
-    -- assignment has already completed. Mirror that by only REGISTERING
-    -- the repeating callback here; it is driven to completion later via
-    -- M._fireAllTimers(), never synchronously inside this call.
-    local handle = { fn = fn, stopped = false, repeating = true }
+    -- Registered only; driven by M._advance() on the virtual clock (real
+    -- timers fire asynchronously, never inside doEvery itself).
+    local handle = { fn = fn, seconds = seconds, stopped = false, repeating = true }
     table.insert(M._pendingTimers, handle)
     return {
       stop = function()
@@ -62,22 +63,59 @@ M.timer = {
   end,
 }
 
+function M._activeRepeating()
+  local n = 0
+  for _, h in ipairs(M._pendingTimers) do
+    if h.repeating and not h.stopped then
+      n = n + 1
+    end
+  end
+  return n
+end
+
+--- Fire every pending ONE-SHOT timer (direction/search timeouts, guards).
 function M._fireAllTimers()
   local timers = M._pendingTimers
-  M._pendingTimers = {}
+  local keep = {}
+  M._pendingTimers = keep
   for _, handle in ipairs(timers) do
-    if not handle.stopped then
-      if handle.repeating then
-        local guard = 0
-        while not handle.stopped and guard < 1000 do
-          handle.fn()
-          guard = guard + 1
-        end
-      else
-        handle.fn()
+    if handle.repeating then
+      if not handle.stopped then
+        keep[#keep + 1] = handle
+      end
+    elseif not handle.stopped then
+      handle.fn()
+    end
+  end
+end
+
+--- Advance the virtual clock by `dt` seconds, firing repeating timers
+-- once per 1/60s step (simulates the run loop).
+function M._advance(dt)
+  local step = 1 / 60
+  local remaining = dt
+  while remaining > 1e-9 do
+    local d = math.min(step, remaining)
+    M._now = M._now + d
+    remaining = remaining - d
+    local snapshot = {}
+    for _, h in ipairs(M._pendingTimers) do
+      snapshot[#snapshot + 1] = h
+    end
+    for _, h in ipairs(snapshot) do
+      if h.repeating and not h.stopped then
+        h.fn()
       end
     end
   end
+  -- prune stopped repeaters
+  local keep = {}
+  for _, h in ipairs(M._pendingTimers) do
+    if not (h.repeating and h.stopped) then
+      keep[#keep + 1] = h
+    end
+  end
+  M._pendingTimers = keep
 end
 
 -- ------------------------------------------------------------------
@@ -138,10 +176,10 @@ M.keycodes = {
 M._eventtaps = {}
 M.eventtap = {
   event = {
-    types = { keyDown = 10 },
+    types = { keyDown = 10, mouseMoved = 5 },
   },
-  new = function(_types, fn)
-    local tap = { fn = fn, running = false }
+  new = function(types, fn)
+    local tap = { fn = fn, running = false, types = types }
     return {
       start = function()
         tap.running = true
@@ -174,7 +212,7 @@ function M._sendKeyDown(spec)
   }
   local consumed = false
   for _, tap in ipairs(M._eventtaps) do
-    if tap.running then
+    if tap.running and tap.types[1] == 10 then
       local result = tap.fn(event)
       if result then
         consumed = true
@@ -182,6 +220,30 @@ function M._sendKeyDown(spec)
     end
   end
   return consumed
+end
+
+--- Test helper: simulate the pointer moving to (x, y).
+function M._sendMouseMove(x, y)
+  local event = {
+    location = function()
+      return { x = x, y = y }
+    end,
+  }
+  for _, tap in ipairs(M._eventtaps) do
+    if tap.running and tap.types[1] == 5 then
+      tap.fn(event)
+    end
+  end
+end
+
+function M._runningTaps(kind)
+  local n = 0
+  for _, tap in ipairs(M._eventtaps) do
+    if tap.running and tap.types[1] == kind then
+      n = n + 1
+    end
+  end
+  return n
 end
 
 -- ------------------------------------------------------------------
@@ -246,6 +308,7 @@ M.canvas = {
     local currentFrame = { x = frame.x, y = frame.y, w = frame.w, h = frame.h }
     local elements = {}
     local deleted = false
+    local writes = {}
     local c
     c = {
       level = function(_self, _lvl)
@@ -273,9 +336,13 @@ M.canvas = {
       frame = function(_self, newFrame)
         if newFrame then
           currentFrame = { x = newFrame.x, y = newFrame.y, w = newFrame.w, h = newFrame.h }
+          writes[#writes + 1] = currentFrame
           return c
         end
         return currentFrame
+      end,
+      _writes = function()
+        return writes
       end,
       _fireMouse = function(event)
         if mouseCallback then
@@ -314,6 +381,14 @@ end
 M._screens = {
   makeScreen("SCREEN-MAIN", { x = 0, y = 0, w = 1440, h = 900 }),
 }
+M._makeScreen = makeScreen
+
+--- Test helper: attach another screen (e.g. negative-coordinate external).
+function M._addScreen(uuid, frame)
+  local sc = makeScreen(uuid, frame)
+  table.insert(M._screens, sc)
+  return sc
+end
 
 M.screen = {
   allScreens = function()
@@ -342,9 +417,10 @@ M.mouse = {
 -- ------------------------------------------------------------------
 -- hs.spaces
 -- ------------------------------------------------------------------
+M._activeSpaces = {} -- screenUUID -> active space id (default 1)
 M.spaces = {
-  activeSpaceOnScreen = function(_screen)
-    return 1
+  activeSpaceOnScreen = function(screen)
+    return M._activeSpaces[screen:getUUID()] or 1
   end,
   spacesForScreen = function(_screenUUID)
     return { 1 }
@@ -364,55 +440,132 @@ M.spaces = {
 }
 
 -- ------------------------------------------------------------------
--- hs.window / hs.window.filter
+-- hs.application (+ watcher) / hs.window / hs.window.filter
 -- ------------------------------------------------------------------
 M._windows = {} -- id -> mock window
+M._apps = {} -- pid -> mock app
 M._nextWindowID = 1000
+M._nextPID = 500
+M._appWatchers = {}
+
+M.application = {
+  watcher = {
+    activated = "activated",
+    deactivated = "deactivated",
+    hidden = "hidden",
+    unhidden = "unhidden",
+    launched = "launched",
+    launching = "launching",
+    terminated = "terminated",
+    new = function(fn)
+      local w = { fn = fn, running = false }
+      return {
+        start = function(self)
+          w.running = true
+          table.insert(M._appWatchers, w)
+          return self
+        end,
+        stop = function(self)
+          w.running = false
+          return self
+        end,
+      }
+    end,
+  },
+  applicationForPID = function(pid)
+    return M._apps[pid]
+  end,
+}
+
+local function fireAppEvent(app, ev)
+  for _, w in ipairs(M._appWatchers) do
+    if w.running then
+      w.fn(app._name, ev, app)
+    end
+  end
+end
+
+local function getApp(opts)
+  for _, app in pairs(M._apps) do
+    if app._bundleID == opts.bundleID and app._name == opts.appName and not app._dead then
+      return app
+    end
+  end
+  M._nextPID = M._nextPID + 1
+  local app
+  app = {
+    _name = opts.appName,
+    _bundleID = opts.bundleID,
+    _pid = M._nextPID,
+    _hidden = false,
+    _windows = {},
+    _dead = false,
+    name = function() return app._name end,
+    bundleID = function() return app._bundleID end,
+    pid = function() return app._pid end,
+    isHidden = function() return app._hidden end,
+    hide = function()
+      if not app._hidden then
+        app._hidden = true
+        fireAppEvent(app, "hidden")
+      end
+      return true
+    end,
+    unhide = function()
+      if app._hidden then
+        app._hidden = false
+        fireAppEvent(app, "unhidden")
+      end
+      return true
+    end,
+    activate = function() return true end,
+    allWindows = function()
+      local out = {}
+      for _, w in ipairs(app._windows) do
+        if M._windows[w.id()] then out[#out + 1] = w end
+      end
+      return out
+    end,
+    visibleWindows = function()
+      local out = {}
+      for _, w in ipairs(app.allWindows()) do
+        if w.isVisible() then out[#out + 1] = w end
+      end
+      return out
+    end,
+  }
+  M._apps[app._pid] = app
+  return app
+end
+
+--- Test helper: the app quits; its windows are destroyed, then terminated.
+function M._terminateApp(app)
+  for _, w in ipairs(app.allWindows()) do
+    w._destroy()
+  end
+  app._dead = true
+  fireAppEvent(app, "terminated")
+  M._apps[app._pid] = nil
+end
 
 function M._makeWindow(opts)
   M._nextWindowID = M._nextWindowID + 1
   local id = opts.id or M._nextWindowID
   local minimized = false
   local frame = opts.frame or { x = 100, y = 100, w = 800, h = 600 }
+  local app = getApp(opts)
   local win
   win = {
-    id = function()
-      return id
-    end,
-    isStandard = function()
-      return opts.isStandard ~= false
-    end,
-    isMinimized = function()
-      return minimized
-    end,
-    isVisible = function()
-      return not minimized
-    end,
-    frame = function()
-      return frame
-    end,
-    setFrame = function(_self, f)
-      frame = f
-    end,
-    application = function()
-      return {
-        name = function()
-          return opts.appName
-        end,
-        bundleID = function()
-          return opts.bundleID
-        end,
-      }
-    end,
-    title = function()
-      return opts.title
-    end,
-    screen = function()
-      return opts.screen or M._screens[1]
-    end,
-    snapshot = function()
-      return { __mockSnapshot = true }
-    end,
+    id = function() return id end,
+    isStandard = function() return opts.isStandard ~= false end,
+    isMinimized = function() return minimized end,
+    isVisible = function() return (not minimized) and (not app._hidden) end,
+    frame = function() return frame end,
+    setFrame = function(_self, f) frame = f end,
+    application = function() return app end,
+    title = function() return opts.title end,
+    screen = function() return opts.screen or M._screens[1] end,
+    snapshot = function() return { __mockSnapshot = true } end,
     minimize = function()
       minimized = true
       M._fireWindowFilterEvent("windowMinimized", win, opts.appName)
@@ -421,18 +574,21 @@ function M._makeWindow(opts)
       minimized = false
       M._fireWindowFilterEvent("windowUnminimized", win, opts.appName)
     end,
-    focus = function() end,
-    raise = function() end,
+    focus = function() M._focusedWindow = win; M._focusLog[#M._focusLog + 1] = id end,
+    raise = function() M._raiseLog[#M._raiseLog + 1] = id end,
     _destroy = function()
       M._fireWindowFilterEvent("windowDestroyed", win, opts.appName)
       M._windows[id] = nil
     end,
   }
+  table.insert(app._windows, win)
   M._windows[id] = win
   return win
 end
 
 M._focusedWindow = nil
+M._focusLog = {}
+M._raiseLog = {}
 M._wfSubscribers = {}
 
 function M._fireWindowFilterEvent(eventName, window, appName)
@@ -444,12 +600,8 @@ function M._fireWindowFilterEvent(eventName, window, appName)
 end
 
 M.window = {
-  focusedWindow = function()
-    return M._focusedWindow
-  end,
-  get = function(id)
-    return M._windows[id]
-  end,
+  focusedWindow = function() return M._focusedWindow end,
+  get = function(id) return M._windows[id] end,
   filter = {
     windowMinimized = "windowMinimized",
     windowUnminimized = "windowUnminimized",
@@ -463,6 +615,15 @@ M.window = {
         end,
         unsubscribeAll = function(_self)
           M._wfSubscribers = {}
+        end,
+        getWindows = function(_self)
+          local out = {}
+          for _, w in pairs(M._windows) do
+            if not w.isMinimized() then
+              out[#out + 1] = w
+            end
+          end
+          return out
         end,
       }
     end,
