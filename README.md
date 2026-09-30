@@ -94,6 +94,10 @@ restore anything, and never tuck mid-search).
 3. The window is captured (frame, app, icon, thumbnail), then hidden. Its
    frame is never changed, it is never moved off-screen, and it is never
    resized. A card appears on the rail.
+4. Focus is explicitly restored to whichever window was genuinely focused
+   immediately before the one just tucked -- see "Focus restoration"
+   below. If there is no such window, focus is left exactly as macOS
+   leaves it after hiding/minimizing; nothing is arbitrarily selected.
 
 `Esc`, or letting the timeout expire, cancels without touching anything.
 Windows on All Spaces are refused (see below).
@@ -123,6 +127,40 @@ This limitation is inherent to the platform, not to Tuck. Window
 enumeration for the "any Space" check comes from the window filter, which
 learns about windows on other Spaces as it observes them; if it cannot
 tell, Tuck chooses minimize (the safe option).
+
+## Focus restoration
+
+Tucking a window never leaves focus to chance. Tuck keeps a small history
+of genuinely-focused windows (by window ID, never by application or
+bundle identity), fed by the documented `windowFocused` window-filter
+event, and after hiding the current window it explicitly focuses whatever
+was focused immediately before it:
+
+- **Two different applications:** tuck App A while App B was previously
+  focused → App B is focused.
+- **Two windows, one application:** tuck Safari window A while Safari
+  window B was previously focused → window B specifically is focused,
+  by its window ID -- never "Safari's main window", never a different
+  Safari window chosen by application identity.
+- **Three or more windows:** if A was focused, then B, then C is tucked,
+  A is focused -- a window that was focused even earlier (and then
+  abandoned) is never arbitrarily selected just because it belongs to the
+  same app.
+- **Multiple screens/Spaces:** the exact previous window is focused even
+  if it's on another screen (matching how focusing any window on another
+  Space normally behaves); a window that is itself currently tucked
+  (hidden) is never offered as a candidate, even if it's still technically
+  the most recent history entry.
+- **No valid previous window:** focus is left alone -- Tuck never falls
+  back to picking an arbitrary sibling window or application.
+
+Tuck's own internal focus changes (restoring a tucked window, and this
+auto-refocus itself) are never mistaken for genuine user focus changes,
+so they can't corrupt the history that later tucks depend on; see
+`window/focus_history.lua` for exactly how. `input.focusHistorySize`
+(default 10) controls how many recent windows are remembered; 2 is the
+strict minimum this feature needs, the rest is headroom so one stale or
+now-invalid entry doesn't prevent falling back to the next valid one.
 
 ## Untuck workflow
 
@@ -389,7 +427,8 @@ Tuck.spoon/
     matcher.lua             -- case-insensitive prefix matching (pure Lua)
   window/
     manager.lua             -- capture/tuck/restore/forget, hide-vs-minimize choice, All-Spaces
-    tracker.lua              -- window filter (minimize/destroy) + application watcher (hide/unhide/quit)
+    tracker.lua              -- window filter (minimize/destroy/focus) + application watcher (hide/unhide/quit)
+    focus_history.lua        -- pure MRU stack of genuinely-focused windows (pure Lua)
   space/
     manager.lua              -- current Space/screen resolution, watchers
     geometry.lua              -- pure rail-stacking + expansion math
@@ -427,6 +466,9 @@ the source):
    off-screen, or resized.
 7. Tuck never fights a user's manual restoration of a tucked window.
 8. A hide-tucked window is the only tuck record of its application.
+9. Tucking always explicitly restores focus to the exact window
+   previously focused (or leaves focus alone) -- never an arbitrary
+   sibling window or application.
 
 ## Testing
 
@@ -442,6 +484,9 @@ Specs: `config_defaults_spec` (schema, validation, migration),
 clamping, trigger strips, negative-coordinate screens), `store_spec`,
 `input_state_spec` (shared shortcut; arrows tuck, letters search, arrows
 never restore, Esc/timeout, narrowing, timer restarts), `matcher_spec`,
+`focus_history_spec` (the pure MRU stack: exact-previous lookup, skipping
+invalid/stale entries, suppression of Tuck's own focus calls, bounded
+size),
 `shortcut_flags_spec`, `animator_spec` (exact landing, monotonic and
 time-based progress, replacement continuity, no late writes, no timer
 leak, easing), and `integration_spec` (the real `init.lua` against
@@ -449,7 +494,9 @@ leak, easing), and `integration_spec` (the real `init.lua` against
 same-app independence across screens/Spaces, manual unhide/unminimize,
 destroy and app quit, All-Spaces rejection, search scopes, parked/reveal/
 hover states on every edge, grace-delay stability, rapid hover, idempotent
-start/stop and no leaked taps/timers/watchers).
+start/stop and no leaked taps/timers/watchers), and `focus_restore_spec`
+(the six focus-restoration scenarios above, end to end through the real
+tracker -> focus_history -> window.manager pipeline).
 
 The mock mirrors documented API signatures, not macOS behavior. Passing
 tests mean the logic and wiring are sound; they do **not** show that the

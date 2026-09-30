@@ -2,8 +2,12 @@
 --
 -- A sensor, not the business-logic owner (per spec). Wraps a single
 -- `hs.window.filter` instance and reports lifecycle events -- minimized,
--- unminimized, destroyed, and (for reconciliation purposes) moved and
--- title-changed -- to callbacks supplied by the owner (window/manager.lua).
+-- unminimized, destroyed, focused, and (for reconciliation purposes)
+-- moved and title-changed -- to callbacks supplied by the owner
+-- (window/manager.lua). windowFocused feeds window/focus_history.lua so
+-- Tuck can restore focus to the exact window that was focused before the
+-- one just tucked (see that module for how it distinguishes genuine
+-- focus changes from Tuck's own internal ones).
 -- This module never decides what those events MEAN; it only forwards
 -- them, defensively (any handler error is caught so one misbehaving
 -- callback, or one application's unusual Accessibility behavior, can
@@ -32,6 +36,7 @@ function Tracker.new(hsRef, logger)
   self.onDestroyed = nil
   self.onMoved = nil
   self.onTitleChanged = nil
+  self.onFocused = nil
 
   -- Application-level callbacks, each `function(app, appName)`. Hiding
   -- (Cmd+H) is an application-wide state, so it is observed with
@@ -90,6 +95,14 @@ function Tracker:start()
     safeCall(this.logger, "windowDestroyed", function()
       if this.onDestroyed then
         this.onDestroyed(window, appName)
+      end
+    end)
+  end)
+
+  self.wf:subscribe(hs.window.filter.windowFocused, function(window, appName)
+    safeCall(this.logger, "windowFocused", function()
+      if this.onFocused then
+        this.onFocused(window, appName)
       end
     end)
   end)

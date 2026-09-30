@@ -24,9 +24,11 @@ local suites = {
   { name = "store_spec", fn = require("tests.store_spec") },
   { name = "input_state_spec", fn = require("tests.input_state_spec") },
   { name = "renderer_spec", fn = require("tests.renderer_spec") },
+  { name = "focus_history_spec", fn = require("tests.focus_history_spec") },
   { name = "matcher_spec", fn = require("tests.matcher_spec") },
   { name = "shortcut_flags_spec", fn = require("tests.shortcut_flags_spec") },
   { name = "animator_spec", fn = require("tests.animator_spec") },
+  { name = "focus_restore_spec", fn = require("tests.focus_restore_spec") },
   { name = "integration_spec", fn = require("tests.integration_spec") },
 }
 

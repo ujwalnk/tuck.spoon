@@ -50,7 +50,7 @@ WindowManager.__index = WindowManager
 -- unlikely in practice, but cheap to guard against).
 local RESTORE_GUARD_SAFETY_NET_SECONDS = 3
 
-function WindowManager.new(hsRef, store, cardManager, spaceManager, previewManager, logger, config)
+function WindowManager.new(hsRef, store, cardManager, spaceManager, previewManager, logger, config, focusHistory)
   local self = setmetatable({}, WindowManager)
   self.hs = hsRef
   self.store = store
@@ -59,6 +59,7 @@ function WindowManager.new(hsRef, store, cardManager, spaceManager, previewManag
   self.previewManager = previewManager
   self.logger = logger
   self.config = config
+  self.focusHistory = focusHistory
 
   self.restoring = {} -- windowID -> true while an internally-initiated unminimize is in flight
   self.hideRestoring = {} -- appKey -> true while an internally-initiated unhide is in flight
@@ -66,6 +67,64 @@ function WindowManager.new(hsRef, store, cardManager, spaceManager, previewManag
   self.listWindows = nil
 
   return self
+end
+
+--- Is `windowID` an appropriate focus target: it still exists, is
+-- currently visible (not minimized, not part of a hidden application --
+-- focusing either would have unwanted side effects, like silently
+-- un-minimizing an unrelated window), and is NOT itself a currently
+-- tucked window (focusing a hidden/tucked window makes no sense; it
+-- should already have been forgotten from history at tuck time, but this
+-- is a cheap second guard).
+function WindowManager:_isValidFocusTarget(windowID)
+  if windowID == nil then
+    return false
+  end
+  if self.store:getByWindowID(windowID) ~= nil then
+    return false
+  end
+  local ok, win = pcall(function()
+    return self.hs.window.get(windowID)
+  end)
+  if not ok or not win then
+    return false
+  end
+  local okVis, visible = pcall(function()
+    return win:isVisible()
+  end)
+  return okVis and visible == true
+end
+
+--- Bring `win` (with known `windowID`) to the front and focus it,
+-- recording the resulting state in focus history WITHOUT depending on
+-- the OS's own focus-changed event (see window/focus_history.lua). This
+-- is the one place Tuck ever calls window:focus() -- used both to
+-- restore a tucked window and to return focus to whichever window was
+-- focused immediately before the one just tucked.
+function WindowManager:_focusExactWindow(win, windowID)
+  if self.focusHistory then
+    self.focusHistory:suppressNextFocus(windowID)
+  end
+  local ok, err = pcall(function()
+    local okApp, app = pcall(function()
+      return win:application()
+    end)
+    if okApp and app then
+      app:activate(true)
+    end
+    win:raise()
+    win:focus()
+  end)
+  if ok then
+    if self.focusHistory then
+      self.focusHistory:record(windowID)
+    end
+  else
+    if self.focusHistory then
+      self.focusHistory:clearSuppression(windowID)
+    end
+  end
+  return ok, err
 end
 
 function WindowManager:_feedback(message)
@@ -402,6 +461,16 @@ function WindowManager:tuck(window, edge)
   record.mechanism = mechanism
   record.pid = capture.pid
 
+  -- Determine the window to restore focus to (the one focused
+  -- immediately before this one, per the tracked history) BEFORE hiding
+  -- anything, since hiding is about to change what's focused.
+  local previousWindowID = nil
+  if self.focusHistory then
+    previousWindowID = self.focusHistory:previousWindowID(capture.windowID, function(id)
+      return self:_isValidFocusTarget(id)
+    end)
+  end
+
   -- Thumbnail and every other piece of state were captured above, BEFORE
   -- the window leaves the screen (a hidden window cannot be captured).
   local okHide, err = pcall(function()
@@ -436,6 +505,27 @@ function WindowManager:tuck(window, edge)
       self.logger.e("Tuck: card creation failed after minimize; window remains tucked in the registry: " .. tostring(cardErr))
     end
     self:_feedback("Tucked " .. record.appName .. " (card display had a problem, but it can still be restored by name)")
+  end
+
+  if self.focusHistory then
+    -- The just-tucked window can never be a valid "previous window" for
+    -- a future tuck while it remains hidden.
+    self.focusHistory:forget(record.windowID)
+  end
+
+  -- Explicitly restore focus to the exact window that was focused before
+  -- this one -- never an arbitrary sibling window, never "whatever macOS
+  -- happens to pick" (which, after hiding/minimizing the focused window,
+  -- is not something Tuck controls or should rely on). If there is no
+  -- valid previous window, focus is deliberately left alone.
+  if previousWindowID ~= nil then
+    local prevWin = self.hs.window.get(previousWindowID)
+    if prevWin then
+      local okFocusPrev, focusPrevErr = self:_focusExactWindow(prevWin, previousWindowID)
+      if not okFocusPrev and self.logger then
+        self.logger.w("Tuck: could not restore focus to the previous window: " .. tostring(focusPrevErr))
+      end
+    end
   end
 
   return true
@@ -529,23 +619,8 @@ function WindowManager:restore(tuckIDOrRecord)
     self.logger.w("Tuck: could not restore exact frame for " .. tostring(record.appName) .. ": " .. tostring(frameErr))
   end
 
-  -- Front + focus THIS exact window. Activating the application first
-  -- makes it frontmost; focus()/raise() on the window object then picks
-  -- the specific window among any siblings.
-  local okFocus, focusErr = pcall(function()
-    if app then
-      app:activate(true)
-    else
-      local okA, a3 = pcall(function()
-        return win:application()
-      end)
-      if okA and a3 then
-        a3:activate(true)
-      end
-    end
-    win:raise()
-    win:focus()
-  end)
+  -- Front + focus THIS exact window (never "the app's main window").
+  local okFocus, focusErr = self:_focusExactWindow(win, windowID)
   if not okFocus and self.logger then
     self.logger.w("Tuck: could not focus/raise restored window: " .. tostring(focusErr))
   end
@@ -572,6 +647,15 @@ end
 
 --- Shared cleanup: remove from store, destroy card, reflow the rail.
 -- Idempotent -- safe even if some of this has already happened.
+-- `_cleanupRecord` is the shared tail of every path that ENDS a tuck:
+-- a successful restore, a manual reveal, or the window being destroyed.
+-- It must NOT forget the window from focus history on its own: for a
+-- restore or manual reveal the window is visible/focusable again and
+-- belongs in history (restore already :record()s it explicitly via
+-- _focusExactWindow; a manual reveal's own genuine windowFocused event,
+-- if any, will record it through the normal event path). Only the
+-- "window is truly gone" callers (handleDestroyed, handleAppTerminated)
+-- forget it themselves, directly, alongside calling this.
 function WindowManager:_cleanupRecord(record)
   local removed = self.store:removeWindow(record.windowID)
   local tuckID = record.tuckID
@@ -627,6 +711,9 @@ function WindowManager:handleDestroyed(window)
   end)
   if not ok or windowID == nil then
     return
+  end
+  if self.focusHistory then
+    self.focusHistory:forget(windowID)
   end
   local record = self.store:getByWindowID(windowID)
   if not record then
@@ -701,6 +788,9 @@ function WindowManager:handleAppTerminated(app)
     end
   end
   for _, rec in ipairs(victims) do
+    if self.focusHistory then
+      self.focusHistory:forget(rec.windowID) -- the process is gone; this window no longer exists
+    end
     self:_cleanupRecord(rec)
   end
   if pid or bundleID then

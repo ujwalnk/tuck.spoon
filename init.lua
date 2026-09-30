@@ -48,6 +48,7 @@ local PreviewManager = require("card.preview")
 local CardManager = require("card.manager")
 local Tracker = require("window.tracker")
 local WindowManager = require("window.manager")
+local FocusHistory = require("window.focus_history")
 
 --- Tuck:configure(overrides)
 --- Method
@@ -103,7 +104,11 @@ function obj:_build()
   self.iconManager = IconManager.new(hs, self.logger)
   self.previewManager = PreviewManager.new(hs, self.logger)
   self.cardManager = CardManager.new(hs, self.store, self.spaceManager, self.iconManager, self.logger, self.config)
-  self.windowManager = WindowManager.new(hs, self.store, self.cardManager, self.spaceManager, self.previewManager, self.logger, self.config)
+  self.focusHistory = FocusHistory.new(self.config.input.focusHistorySize)
+  self.windowManager = WindowManager.new(
+    hs, self.store, self.cardManager, self.spaceManager, self.previewManager,
+    self.logger, self.config, self.focusHistory
+  )
   self.tracker = Tracker.new(hs, self.logger)
   self.windowManager.listWindows = function()
     return self.tracker:allWindows()
@@ -140,6 +145,14 @@ function obj:_build()
   end
   self.tracker.onAppTerminated = function(app, _appName)
     this.windowManager:handleAppTerminated(app)
+  end
+  self.tracker.onFocused = function(window, _appName)
+    local ok, windowID = pcall(function()
+      return window:id()
+    end)
+    if ok then
+      this.focusHistory:onWindowFocused(windowID)
+    end
   end
   self.tracker.onDestroyed = function(window, _appName)
     this.windowManager:handleDestroyed(window)

@@ -24,6 +24,12 @@ M.defaults = {
     -- Seconds the command mode waits for input after the shortcut. It
     -- also restarts after every accepted search letter.
     commandTimeout = 1.5,
+    -- How many recently-focused windows to remember, so tucking can
+    -- restore focus to the exact window that was focused immediately
+    -- before it (never an arbitrary sibling window or application). 2 is
+    -- the strict minimum (current + previous); a little headroom lets a
+    -- stale/invalid entry be skipped in favor of a still-valid one.
+    focusHistorySize = 10,
   },
 
   card = {
@@ -226,6 +232,9 @@ function M.validate(cfg)
   end
   if type(cfg.input.commandTimeout) ~= "number" or cfg.input.commandTimeout <= 0 then
     return false, "configuration.input.commandTimeout must be a positive number"
+  end
+  if type(cfg.input.focusHistorySize) ~= "number" or cfg.input.focusHistorySize < 2 or cfg.input.focusHistorySize % 1 ~= 0 then
+    return false, "configuration.input.focusHistorySize must be an integer >= 2"
   end
 
   if type(cfg.card) ~= "table" then

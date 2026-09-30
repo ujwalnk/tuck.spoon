@@ -574,7 +574,14 @@ function M._makeWindow(opts)
       minimized = false
       M._fireWindowFilterEvent("windowUnminimized", win, opts.appName)
     end,
-    focus = function() M._focusedWindow = win; M._focusLog[#M._focusLog + 1] = id end,
+    focus = function()
+      M._focusedWindow = win
+      M._focusLog[#M._focusLog + 1] = id
+      -- Real Hammerspoon fires windowFocused for any focus change,
+      -- Tuck-initiated or not; the production suppression logic is what
+      -- tells them apart, so the mock must not special-case this.
+      M._fireWindowFilterEvent("windowFocused", win, opts.appName)
+    end,
     raise = function() M._raiseLog[#M._raiseLog + 1] = id end,
     _destroy = function()
       M._fireWindowFilterEvent("windowDestroyed", win, opts.appName)
@@ -589,6 +596,14 @@ end
 M._focusedWindow = nil
 M._focusLog = {}
 M._raiseLog = {}
+
+--- Test helper: simulate the USER (not Tuck) focusing `win` directly --
+-- e.g. clicking it, Cmd-Tabbing to it. Fires the same windowFocused
+-- event a real focus change would.
+function M._userFocus(win)
+  M._focusedWindow = win
+  win.focus()
+end
 M._wfSubscribers = {}
 
 function M._fireWindowFilterEvent(eventName, window, appName)
@@ -606,6 +621,7 @@ M.window = {
     windowMinimized = "windowMinimized",
     windowUnminimized = "windowUnminimized",
     windowDestroyed = "windowDestroyed",
+    windowFocused = "windowFocused",
     windowMoved = "windowMoved",
     windowTitleChanged = "windowTitleChanged",
     new = function(_allowAll)
