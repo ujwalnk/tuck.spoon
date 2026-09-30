@@ -432,6 +432,60 @@ local function run()
     Tuck:stop()
   end
 
+  -- ===== Shared shortcut reveals every tucked card, then releases =====
+  do
+    local hs, Tuck = boot()
+    local a = newWin(hs, "Alpha"); local b = newWin(hs, "Beta")
+    tuck(hs, a, "left"); tuck(hs, b, "left")
+    settle(hs)
+    local fa, fb = frameOf(Tuck, a), frameOf(Tuck, b)
+    t.eq(fa.x + fa.w, 8, "parked before the shortcut")
+    t.eq(fb.x + fb.w, 8)
+
+    hs._focusedWindow = newWin(hs, "Finder")
+    shortcut(hs)
+    settle(hs)
+    t.isTrue(Tuck.cardManager.commandRevealActive)
+    fa, fb = frameOf(Tuck, a), frameOf(Tuck, b)
+    t.eq(fa.x, 8, "shortcut brings every tucked card fully inside the screen")
+    t.eq(fb.x, 8)
+    t.eq(fa.w, 72, "still the collapsed size, not expanded")
+
+    -- concludes on Esc, and rails return to parked
+    esc(hs)
+    settle(hs)
+    t.isFalse(Tuck.cardManager.commandRevealActive)
+    fa = frameOf(Tuck, a)
+    t.eq(fa.x + fa.w, 8, "parked again once the command ends")
+
+    -- also concludes on a completed tuck
+    hs._focusedWindow = newWin(hs, "Preview")
+    shortcut(hs)
+    t.isTrue(Tuck.cardManager.commandRevealActive)
+    arrow(hs, "left")
+    t.isFalse(Tuck.cardManager.commandRevealActive, "ends the moment a tuck completes")
+
+    -- and on a completed restore (unique-letter search)
+    hs._focusedWindow = newWin(hs, "Finder2")
+    shortcut(hs)
+    letter(hs, "a") -- unique match: Alpha
+    t.isFalse(Tuck.cardManager.commandRevealActive, "ends the moment a restore completes")
+
+    -- reveal-all does not fight an already-hovered card's full expansion
+    local c = newWin(hs, "Gamma")
+    tuck(hs, c, "left")
+    local cc = canvasOf(Tuck, c)
+    cc._fireMouse("mouseEnter")
+    settle(hs)
+    t.eq(cc.frame().w, 220, "hover already expanded")
+    hs._focusedWindow = newWin(hs, "Finder3")
+    shortcut(hs)
+    settle(hs)
+    t.eq(cc.frame().w, 220, "reveal-all does not shrink an expanded card")
+    esc(hs)
+    Tuck:stop()
+  end
+
   -- ===== Retract grace: leaving and re-entering must not flicker =====
   do
     local hs, Tuck = boot()

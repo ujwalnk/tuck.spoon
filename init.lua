@@ -203,6 +203,10 @@ function obj:_dispatch(res)
     return
   elseif res.action == "startCommandTimer" then
     self:_startCommandTimer()
+    -- Bring every tucked card fully on-screen while the command is open,
+    -- so the user can see everything tucked before choosing an arrow or
+    -- typing a search letter.
+    self.cardManager:setCommandRevealActive(true)
   elseif res.action == "restartCommandTimer" then
     self:_startCommandTimer()
     local tuckIDs = {}
@@ -212,16 +216,19 @@ function obj:_dispatch(res)
     self.cardManager:setSearchMatches(tuckIDs)
   elseif res.action == "tuck" then
     self:_cancelTimers()
+    self.cardManager:setCommandRevealActive(false)
     local win = hs.window.focusedWindow()
     self.windowManager:tuck(win, res.edge)
   elseif res.action == "restore" then
     self:_cancelTimers()
+    self.cardManager:setCommandRevealActive(false)
     if res.collapseSearch then
       self.cardManager:clearSearchExpansion()
     end
     self.windowManager:restore(res.tuckID)
   elseif res.action == "cancel" then
     self:_cancelTimers()
+    self.cardManager:setCommandRevealActive(false)
     if res.collapseSearch then
       self.cardManager:clearSearchExpansion()
     end

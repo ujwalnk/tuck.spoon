@@ -326,13 +326,11 @@ function WindowManager:_chooseMechanism(capture)
     return "minimize"
   end
   if #self:_recordsForApp(capture.pid, capture.bundleID) > 0 then
-    -- return "minimize"
-    return "hide"
+    return "minimize"
   end
   local others = self:_countOtherLiveWindows(capture)
   if others == nil or others > 0 then
-    -- return "minimize"
-    return "hide"
+    return "minimize"
   end
   return "hide"
 end

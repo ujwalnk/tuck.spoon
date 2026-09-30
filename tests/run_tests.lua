@@ -23,6 +23,7 @@ local suites = {
   { name = "geometry_spec", fn = require("tests.geometry_spec") },
   { name = "store_spec", fn = require("tests.store_spec") },
   { name = "input_state_spec", fn = require("tests.input_state_spec") },
+  { name = "renderer_spec", fn = require("tests.renderer_spec") },
   { name = "matcher_spec", fn = require("tests.matcher_spec") },
   { name = "shortcut_flags_spec", fn = require("tests.shortcut_flags_spec") },
   { name = "animator_spec", fn = require("tests.animator_spec") },

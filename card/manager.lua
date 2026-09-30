@@ -69,6 +69,10 @@ function CardManager.new(hsRef, store, spaceManager, iconManager, logger, config
   self.retractTimers = {} -- railKey -> hs.timer (one-shot)
   self.railZones = {} -- railKey -> { frame = {..}, edge = ..., screenUUID, spaceID, inside = bool }
   self.moveTap = nil
+  -- While true (a Tuck command is in progress -- see setCommandRevealActive),
+  -- every peek rail rests fully visible instead of parked/edge-revealed,
+  -- so the whole shelf is visible while choosing a direction or searching.
+  self.commandRevealActive = false
 
   -- Set by init.lua: function(tuckID) -- invoked on card click.
   self.onCardClicked = nil
@@ -108,10 +112,13 @@ function CardManager:_screenForUUID(screenUUID)
 end
 
 --- Rest depth (pixels of the card inside the usable area) for a rail, or
--- nil to use the classic inset positioning.
+-- nil to use the classic inset positioning (fully visible).
 function CardManager:_restDepth(edge, revealed)
   if not self:_peekEnabled(edge) then
     return nil
+  end
+  if self.commandRevealActive then
+    return nil -- fully visible: a command is in progress, show every card
   end
   local card = self.config.card
   return revealed and card.edgeRevealSize or card.peekSize
@@ -311,16 +318,31 @@ function CardManager:reflowRail(screenUUID, spaceID, edge, kind)
 end
 
 --- Reflow every rail that has cards (screen / Space / config changes).
-function CardManager:reflowAll()
+function CardManager:reflowAll(kind)
   for shelfKey, shelf in pairs(self.store.shelves) do
     local screenUUID, spaceID = shelfKey:match("^(.-)|(.+)$")
     local numericSpaceID = tonumber(spaceID)
     for _, edge in ipairs({ "left", "right", "top", "bottom" }) do
       if #shelf[edge] > 0 then
-        self:reflowRail(screenUUID, numericSpaceID or spaceID, edge)
+        self:reflowRail(screenUUID, numericSpaceID or spaceID, edge, kind)
       end
     end
   end
+end
+
+--- Toggle "show every tucked card" mode: while active, every peek rail's
+-- resting cards sit fully on-screen (still at their collapsed size, not
+-- expanded) instead of parked/edge-revealed, so the whole shelf is
+-- visible while a Tuck command is in progress. Cards still hovered or
+-- search-matched are unaffected (they already show fully expanded).
+-- Idempotent; a no-op when already in the requested state.
+function CardManager:setCommandRevealActive(active)
+  active = active and true or false
+  if self.commandRevealActive == active then
+    return
+  end
+  self.commandRevealActive = active
+  self:reflowAll("reveal")
 end
 
 -- ---------------------------------------------------------------------
@@ -558,6 +580,7 @@ function CardManager:stop()
   self.railRevealed = {}
   self.railPointer = {}
   self.railZones = {}
+  self.commandRevealActive = false
   if self.moveTap then
     self.moveTap:stop()
     self.moveTap = nil

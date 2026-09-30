@@ -62,7 +62,13 @@ spoon.Tuck:stop()    -- idempotent; unbinds shortcuts, stops watchers,
 | --- | --- | --- |
 | Start a Tuck command (tuck **or** untuck) | `Fn+T` | `shortcuts.tuck` |
 
-There is no separate untuck shortcut. After `Fn+T`:
+There is no separate untuck shortcut. **Pressing it also brings every
+currently tucked card fully into view** (still at its normal collapsed
+size, not expanded) so you can see what's parked before choosing an
+arrow or typing a search letter; cards return to parked the moment the
+command ends (tuck, restore, cancel, or timeout).
+
+After `Fn+T`:
 
 | Next key | Result |
 | --- | --- |
@@ -232,11 +238,14 @@ spoon.Tuck:configure({
   card = {
     showAppIcon = true, showThumbnail = true,
     showAppName = true, showWindowTitle = false,
-    collapsedWidth = 72, collapsedHeight = 72,
-    expandedWidth = 220, expandedHeight = 160,
+    collapsedWidth = 72, collapsedHeight = 72,   -- card size at the edge
+    expandedWidth = 220, expandedHeight = 160,   -- card size on hover/search-match
     cornerRadius = 14, opacity = 0.92, edgeInset = 8,
-    peekSize = 8,          -- parked: px visible
-    edgeRevealSize = 40,   -- pointer near edge: px visible
+    backgroundColor = { red = 0.13, green = 0.13, blue = 0.15 },
+    borderColor = { red = 1, green = 1, blue = 1 },
+    textColor = { red = 1, green = 1, blue = 1 },
+    peekSize = 8,          -- parked: how many px stay visible (rest is off-screen)
+    edgeRevealSize = 40,   -- pointer near edge: how many px become visible
     edgeTriggerSize = 64,  -- depth of the edge strip that starts the reveal
     revealGraceDelay = 0.18,
     expansionEnabled = true,
@@ -344,12 +353,13 @@ need a window back after a restart, just re-tuck it.
 | `shortcuts.tuck` | `{mods={"fn"}, key="t"}` | the only shortcut |
 | `input.commandTimeout` | `1.5` | seconds; restarts after each accepted letter |
 | `card.showAppIcon` / `showThumbnail` / `showAppName` / `showWindowTitle` | `true`/`true`/`true`/`false` | |
-| `card.collapsedWidth` / `collapsedHeight` | `72` / `72` | card size (never changed by parking/reveal) |
-| `card.expandedWidth` / `expandedHeight` | `220` / `160` | hover / search size; ≥ collapsed |
-| `card.cornerRadius`, `card.opacity` | `14`, `0.92` | |
+| `card.collapsedWidth` / `collapsedHeight` | `72` / `72` | card size **at the screen edge** (never changed by parking/reveal) |
+| `card.expandedWidth` / `expandedHeight` | `220` / `160` | card size on hover / search-match; ≥ collapsed |
+| `card.cornerRadius`, `card.opacity` | `14`, `0.92` | opacity is the background's alpha |
+| `card.backgroundColor` / `borderColor` / `textColor` | dark gray / white / white | each `{red=,green=,blue=}` in 0–1 |
 | `card.edgeInset` | `8` | gap from the edge on non-peek rails |
-| `card.peekSize` | `8` | px visible when parked (peek rails) |
-| `card.edgeRevealSize` | `40` | px visible during edge reveal; ≥ peekSize, ≤ card size |
+| `card.peekSize` | `8` | how many px of the card stay visible when parked (the rest sits off-screen); peek rails only |
+| `card.edgeRevealSize` | `40` | how many px become visible on edge reveal; ≥ peekSize, ≤ card size |
 | `card.edgeTriggerSize` | `64` | depth of the trigger strip; ≥ peekSize (keep > edgeRevealSize) |
 | `card.revealGraceDelay` | `0.18` | seconds before a rail retracts |
 | `card.expansionEnabled` | `true` | disables hover/search expansion |
@@ -452,8 +462,8 @@ The following can only be verified by running Tuck inside real
 Hammerspoon on macOS:
 
 **Basic tuck / hiding**
-- [x] `Fn+T` then each arrow tucks to the right rail
-- [x] Single-window app (e.g. VS Code): app hides like Cmd+H
+- [ ] `Fn+T` then each arrow tucks to the right rail
+- [ ] Single-window app (e.g. VS Code): app hides like Cmd+H
 - [ ] Safari with several windows: only the chosen window disappears
   (minimized); the others stay visible
 - [ ] Terminal/iTerm2 with several windows behaves the same
@@ -525,6 +535,8 @@ Hammerspoon on macOS:
 - [ ] Moving the pointer along the strip and away retracts once, after
   a short delay
 - [ ] Search-matched cards expand with the same motion
+- [ ] Pressing the shortcut brings every parked card fully into view, and
+  it parks again once you tuck, restore, cancel or time out
 - [ ] Rapid repeated tuck / untuck leaves no stale cards or hidden apps
 - [ ] Clicking near the screen edge (scrollbars) still works
 

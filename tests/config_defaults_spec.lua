@@ -40,6 +40,19 @@ local function run()
   t.isFalse(valid({ animation = { easing = "bouncy" } }))
   t.isFalse(valid({ animation = { hoverDuration = -1 } }))
 
+  -- Array-valued fields (mods) replace wholesale; ordinary nested tables
+  -- still merge through, even when empty (regression test for a bug
+  -- where merging {} onto {"fn"} silently kept "fn").
+  do
+    local m = defaults.merge(D, { shortcuts = { tuck = { mods = {}, key = "f20" } } })
+    t.eq(#m.shortcuts.tuck.mods, 0, "empty mods override clears the default modifier")
+    t.eq(m.shortcuts.tuck.key, "f20")
+    t.isTrue(defaults.validate(m), "a bare, unmodified shortcut is valid")
+
+    local m2 = defaults.merge(D, { shortcuts = { tuck = { mods = { "cmd", "shift" }, key = "t" } } })
+    t.eq(#m2.shortcuts.tuck.mods, 2, "a non-empty mods override also replaces, not appends")
+  end
+
   -- migration from the previous schema
   do
     local m = defaults.merge(D, {
@@ -48,6 +61,7 @@ local function run()
       card = { animationDuration = 0.4 },
     })
     t.isNil(m.shortcuts.untuck, "old untuck shortcut is dropped")
+    t.eq(m.shortcuts.tuck.key, "t", "an empty shortcuts.{} after stripping untuck still merges through defaults")
     t.eq(m.input.commandTimeout, 2.5, "directionTimeout migrates to commandTimeout")
     t.isNil(m.input.directionTimeout)
     t.eq(m.animation.hoverDuration, 0.4, "card.animationDuration migrates")

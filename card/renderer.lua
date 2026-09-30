@@ -41,8 +41,18 @@ function Renderer.buildElements(record, size, cardConfig, icon, thumbnail)
     type = "rectangle",
     action = "fill",
     roundedRectRadii = { xRadius = cardConfig.cornerRadius, yRadius = cardConfig.cornerRadius },
-    fillColor = { red = 0.13, green = 0.13, blue = 0.15, alpha = clamp01(cardConfig.opacity) },
-    strokeColor = { white = 1, alpha = 0.08 },
+    fillColor = {
+      red = cardConfig.backgroundColor.red,
+      green = cardConfig.backgroundColor.green,
+      blue = cardConfig.backgroundColor.blue,
+      alpha = clamp01(cardConfig.opacity),
+    },
+    strokeColor = {
+      red = cardConfig.borderColor.red,
+      green = cardConfig.borderColor.green,
+      blue = cardConfig.borderColor.blue,
+      alpha = 0.08,
+    },
     strokeWidth = 1,
     withShadow = true,
   }
@@ -106,7 +116,12 @@ function Renderer.buildElements(record, size, cardConfig, icon, thumbnail)
         text = record.appName,
         frame = { x = pct(0.03), y = pct(y), w = pct(0.94), h = pct(lineFrac) },
         textSize = 11,
-        textColor = { white = 1, alpha = 0.95 },
+        textColor = {
+          red = cardConfig.textColor.red,
+          green = cardConfig.textColor.green,
+          blue = cardConfig.textColor.blue,
+          alpha = 0.95,
+        },
         textAlignment = "center",
         textLineBreak = "truncateTail",
       }
@@ -118,7 +133,12 @@ function Renderer.buildElements(record, size, cardConfig, icon, thumbnail)
         text = record.windowTitle or "",
         frame = { x = pct(0.03), y = pct(y), w = pct(0.94), h = pct(lineFrac) },
         textSize = 9.5,
-        textColor = { white = 1, alpha = 0.65 },
+        textColor = {
+          red = cardConfig.textColor.red,
+          green = cardConfig.textColor.green,
+          blue = cardConfig.textColor.blue,
+          alpha = 0.65,
+        },
         textAlignment = "center",
         textLineBreak = "truncateTail",
       }

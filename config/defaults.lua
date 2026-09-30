@@ -39,6 +39,13 @@ M.defaults = {
 
     cornerRadius = 14,
     opacity = 0.92,
+    -- Card colors. Each is {red=,green=,blue=} in 0..1 (no alpha field:
+    -- the background's transparency is `opacity` above; label alpha is
+    -- fixed relative to textColor so the title can stay slightly dimmer
+    -- than the app name).
+    backgroundColor = { red = 0.13, green = 0.13, blue = 0.15 },
+    borderColor = { red = 1, green = 1, blue = 1 }, -- drawn faint; see card/renderer.lua
+    textColor = { red = 1, green = 1, blue = 1 },
     -- Distance from the screen/work-area edge to the card's outer edge
     -- when a rail is NOT peeking (rails.<edge>.peek = false).
     edgeInset = 8,
@@ -113,6 +120,18 @@ local function deepcopy(value)
 end
 M.deepcopy = deepcopy
 
+--- Config fields that hold a LIST (currently only a shortcut's `mods`)
+-- rather than a nested settings table. An override for one of these must
+-- REPLACE the default wholesale, never merge key-by-key: merging {} onto
+-- {"fn"} would otherwise leave the default "fn" in place, silently
+-- turning an override meant to clear every modifier into a no-op. This
+-- is a fixed, named set rather than a "does it look like an array"
+-- guess, because an empty table is ambiguous (e.g. an override of
+-- `shortcuts = {}` -- as produced by stripping a migrated `untuck` key --
+-- must still merge through to keep the surviving defaults, not replace
+-- them).
+local ARRAY_FIELDS = { mods = true }
+
 --- Translate configuration keys from earlier releases into the current
 -- schema (on a copy; the caller's table is never modified).
 --   shortcuts.untuck            -> removed (one shared shortcut now)
@@ -156,7 +175,7 @@ local function mergeConfig(base, overrides, skipMigration)
     return out
   end
   for key, value in pairs(overrides) do
-    if type(value) == "table" and type(out[key]) == "table" then
+    if type(value) == "table" and type(out[key]) == "table" and not ARRAY_FIELDS[key] then
       out[key] = mergeConfig(out[key], value, true)
     else
       out[key] = deepcopy(value)
@@ -225,6 +244,17 @@ function M.validate(cfg)
   end
   if type(cfg.card.opacity) ~= "number" or cfg.card.opacity < 0 or cfg.card.opacity > 1 then
     return false, "configuration.card.opacity must be between 0 and 1"
+  end
+  for _, colorField in ipairs({ "backgroundColor", "borderColor", "textColor" }) do
+    local c = cfg.card[colorField]
+    if type(c) ~= "table" then
+      return false, "configuration.card." .. colorField .. " must be a table"
+    end
+    for _, channel in ipairs({ "red", "green", "blue" }) do
+      if type(c[channel]) ~= "number" or c[channel] < 0 or c[channel] > 1 then
+        return false, "configuration.card." .. colorField .. "." .. channel .. " must be between 0 and 1"
+      end
+    end
   end
   if type(cfg.card.edgeInset) ~= "number" or cfg.card.edgeInset < 0 then
     return false, "configuration.card.edgeInset must be a non-negative number"
