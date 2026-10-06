@@ -38,9 +38,17 @@ end
 
 --- Generate a new, stable tuckID. Monotonic + prefixed so it can never
 -- collide with a windowID or be confused with one.
+--
+-- Persisted tuckIDs are re-registered after a restart while this counter
+-- starts over, so a candidate that collides with a live record is skipped
+-- rather than ever handed out twice.
 function Store:nextTuckID()
-  self._tuckSeq = self._tuckSeq + 1
-  return string.format("tuck-%d-%d", os.time and os.time() or 0, self._tuckSeq)
+  local id
+  repeat
+    self._tuckSeq = self._tuckSeq + 1
+    id = string.format("tuck-%d-%d", os.time and os.time() or 0, self._tuckSeq)
+  until self.byTuckID[id] == nil
+  return id
 end
 
 local function emptyShelf()
@@ -177,6 +185,38 @@ function Store:windowsForSpace(spaceID, screenUUID)
     end
   end
   return out
+end
+
+--- Every record in a stable, persistence-friendly order: shelf key, then
+-- edge, then rail position. Each returned entry is `{ record, order }`
+-- where `order` is the 1-based position on its rail.
+function Store:orderedRecords()
+  local keys = {}
+  for key in pairs(self.shelves) do
+    keys[#keys + 1] = key
+  end
+  table.sort(keys)
+  local out = {}
+  for _, key in ipairs(keys) do
+    local shelf = self.shelves[key]
+    for _, edge in ipairs(EDGES) do
+      for i, tuckID in ipairs(shelf[edge]) do
+        local rec = self.byTuckID[tuckID]
+        if rec then
+          out[#out + 1] = { record = rec, order = i }
+        end
+      end
+    end
+  end
+  return out
+end
+
+--- Drop every record and shelf (used when the Spoon stops: runtime state
+-- is rebuilt from the persisted file on the next start).
+function Store:clear()
+  self.windows = {}
+  self.byTuckID = {}
+  self.shelves = {}
 end
 
 function Store.edges()

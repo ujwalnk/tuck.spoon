@@ -8,10 +8,110 @@
 -- the canvas at whatever size the canvas currently is.
 --
 -- Element order (back to front): background, thumbnail, app icon
--- (overlapping the thumbnail, bottom-left, "parked application" style),
--- app name, window title.
+-- (a badge overlapping the thumbnail, anchored toward the INWARD side of
+-- the card -- the side facing the usable screen area), app name, window
+-- title.
+--
+-- Thumbnails arrive already rounded (card/preview.lua bakes transparent
+-- rounded corners into the image, because an image element letterboxes
+-- inside its frame and clipping the frame would not round the visible
+-- picture). `Renderer.thumbnailRadius` is the single place that derives
+-- that radius from the card's configured corner radius.
 
 local Renderer = {}
+
+-- Padding between the card edge and its media area, as a fraction of the
+-- canvas. Shared by buildElements and the thumbnail radius derivation.
+local PAD = 0.04
+-- Badge geometry (fractions of the canvas) and its gap to the inward edge.
+local BADGE_W = 0.28
+local BADGE_INWARD_MARGIN = 0.02
+
+--- Which side of the card faces the usable screen area, expressed as the
+-- anchor the app-icon badge uses. Left rail -> inward is RIGHT; right
+-- rail -> inward is LEFT; top rail -> inward is BOTTOM; bottom rail ->
+-- inward is TOP. Along the other axis the badge is centred for top and
+-- bottom rails (so those cards stay balanced) and sits on the bottom for
+-- left/right rails.
+--   returns { h = "left"|"right"|"center", v = "top"|"bottom" }
+function Renderer.inwardAnchor(edge)
+  if edge == "left" then
+    return { h = "right", v = "bottom" }
+  elseif edge == "right" then
+    return { h = "left", v = "bottom" }
+  elseif edge == "top" then
+    return { h = "center", v = "bottom" }
+  end
+  return { h = "center", v = "top" } -- bottom rail
+end
+
+local function alignmentName(anchor)
+  local v, h = anchor.v, anchor.h
+  if h == "center" then
+    return v -- "top" | "bottom"
+  end
+  return v .. h:sub(1, 1):upper() .. h:sub(2) -- e.g. "bottomRight"
+end
+
+--- Layout of the media area for a card configuration. Returns the label
+-- fraction, the media height fraction, and the media size in pixels at
+-- the collapsed card size.
+local function mediaLayout(cardConfig, size, hasName, hasTitle)
+  local h = size.h
+  local labelLines = (hasName and 1 or 0) + (hasTitle and 1 or 0)
+  local labelPx = labelLines > 0 and math.min(h * 0.32, 15 * labelLines + 6) or 0
+  local labelFrac = labelPx / h
+  local mediaH = 1 - labelFrac - 2 * PAD
+  if mediaH < 0.1 then
+    mediaH = 0.1
+  end
+  return {
+    labelLines = labelLines,
+    labelFrac = labelFrac,
+    mediaH = mediaH,
+    mediaPxW = (1 - 2 * PAD) * size.w,
+    mediaPxH = mediaH * size.h,
+  }
+end
+
+--- Radius (pixels, at the collapsed card size) of the thumbnail's
+-- corners: concentric with the card's own rounded corner, i.e. the card's
+-- configured radius minus the padding between card edge and thumbnail.
+function Renderer.thumbnailRadius(cardConfig)
+  local pad = PAD * math.min(cardConfig.collapsedWidth, cardConfig.collapsedHeight)
+  return math.max(0, cardConfig.cornerRadius - pad)
+end
+
+--- Width (pixels) at which a picture of `aspect` (w/h) is shown, a
+-- reference used to turn the card-derived corner radius into the baked
+-- image's pixels. The picture is baked ONCE yet displayed at every card
+-- size (parked/revealed compact card, expanded card), and scaling an image
+-- scales its corners with it, so a radius tuned for one size would look
+-- too square at the small size or too blobby at the large one. The
+-- geometric mean of the compact and expanded display widths keeps the
+-- corner within the same ~1.7x factor of the intended radius at both.
+function Renderer.referenceDisplayWidth(cardConfig, aspect)
+  local function displayWidth(size)
+    local layout = mediaLayout(cardConfig, size, cardConfig.showAppName, cardConfig.showWindowTitle)
+    return math.min(layout.mediaPxW, layout.mediaPxH * aspect)
+  end
+  local compact = displayWidth({ w = cardConfig.collapsedWidth, h = cardConfig.collapsedHeight })
+  local expanded = displayWidth({ w = cardConfig.expandedWidth, h = cardConfig.expandedHeight })
+  return math.sqrt(compact * expanded)
+end
+
+--- Size (pixels) in which a thumbnail is shown on a collapsed card; the
+-- preview baker uses it to convert Renderer.thumbnailRadius into image
+-- pixels for an image of a given size.
+function Renderer.collapsedMediaSize(cardConfig)
+  local layout = mediaLayout(
+    cardConfig,
+    { w = cardConfig.collapsedWidth, h = cardConfig.collapsedHeight },
+    cardConfig.showAppName,
+    cardConfig.showWindowTitle
+  )
+  return layout.mediaPxW, layout.mediaPxH
+end
 
 local function clamp01(n)
   if n < 0 then
@@ -35,7 +135,6 @@ end
 -- pixel height of the text labels into a percentage.
 function Renderer.buildElements(record, size, cardConfig, icon, thumbnail)
   local elements = {}
-  local h = size.h
 
   elements[#elements + 1] = {
     type = "rectangle",
@@ -62,15 +161,9 @@ function Renderer.buildElements(record, size, cardConfig, icon, thumbnail)
   local hasName = cardConfig.showAppName and record.appName ~= nil and record.appName ~= ""
   local hasTitle = cardConfig.showWindowTitle and record.windowTitle ~= nil and record.windowTitle ~= ""
 
-  local labelLines = (hasName and 1 or 0) + (hasTitle and 1 or 0)
-  local labelPx = labelLines > 0 and math.min(h * 0.32, 15 * labelLines + 6) or 0
-  local labelFrac = labelPx / h
-
-  local pad = 0.04
-  local mediaH = 1 - labelFrac - 2 * pad
-  if mediaH < 0.1 then
-    mediaH = 0.1
-  end
+  local layout = mediaLayout(cardConfig, size, hasName, hasTitle)
+  local labelLines, labelFrac, mediaH = layout.labelLines, layout.labelFrac, layout.mediaH
+  local pad = PAD
   local function pct(f)
     return string.format("%.4f%%", f * 100)
   end
@@ -97,12 +190,31 @@ function Renderer.buildElements(record, size, cardConfig, icon, thumbnail)
   end
 
   if hasThumbnail and hasIcon then
-    -- Icon badge overlapping the thumbnail's bottom-left corner.
+    -- Icon badge overlapping the thumbnail, anchored toward the inward
+    -- side of the card (see Renderer.inwardAnchor). Only the badge moves;
+    -- the rest of the card is identical for every edge.
+    local anchor = Renderer.inwardAnchor(record.edge)
+    local bw = BADGE_W
+    local bh = mediaH * 0.36
+    local bx
+    if anchor.h == "right" then
+      bx = 1 - BADGE_INWARD_MARGIN - bw
+    elseif anchor.h == "left" then
+      bx = BADGE_INWARD_MARGIN
+    else
+      bx = (1 - bw) / 2
+    end
+    local by
+    if anchor.v == "bottom" then
+      by = pad + mediaH * 0.98 - bh
+    else
+      by = pad + mediaH * 0.02
+    end
     elements[#elements + 1] = {
       type = "image",
       image = icon,
-      frame = { x = pct(pad + 0.01), y = pct(pad + mediaH * 0.62), w = pct(0.28), h = pct(mediaH * 0.36) },
-      imageAlignment = "bottomLeft",
+      frame = { x = pct(bx), y = pct(by), w = pct(bw), h = pct(bh) },
+      imageAlignment = alignmentName(anchor),
       imageScaling = "scaleProportionally",
     }
   end

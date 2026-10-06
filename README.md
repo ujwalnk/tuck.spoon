@@ -130,37 +130,45 @@ tell, Tuck chooses minimize (the safe option).
 
 ## Focus restoration
 
-Tucking a window never leaves focus to chance. Tuck keeps a small history
-of genuinely-focused windows (by window ID, never by application or
-bundle identity), fed by the documented `windowFocused` window-filter
-event, and after hiding the current window it explicitly focuses whatever
-was focused immediately before it:
+Tucking a window never leaves focus to chance. The approach is ported
+from [MinimizeToPrevious.spoon](https://github.com/ujwalnk/MinimizeToPrevious.spoon):
+**focus the previous window first, then hide the current one**, so macOS
+never gets to pick (and activate) some other window when the current one
+disappears. Tuck is self-contained (the logic is ported, not required as a
+dependency).
 
-- **Two different applications:** tuck App A while App B was previously
-  focused → App B is focused.
-- **Two windows, one application:** tuck Safari window A while Safari
-  window B was previously focused → window B specifically is focused,
-  by its window ID -- never "Safari's main window", never a different
-  Safari window chosen by application identity.
-- **Three or more windows:** if A was focused, then B, then C is tucked,
-  A is focused -- a window that was focused even earlier (and then
-  abandoned) is never arbitrarily selected just because it belongs to the
-  same app.
-- **Multiple screens/Spaces:** the exact previous window is focused even
-  if it's on another screen (matching how focusing any window on another
-  Space normally behaves); a window that is itself currently tucked
-  (hidden) is never offered as a candidate, even if it's still technically
-  the most recent history entry.
-- **No valid previous window:** focus is left alone -- Tuck never falls
-  back to picking an arbitrary sibling window or application.
+Order of operations when you tuck window A:
 
-Tuck's own internal focus changes (restoring a tucked window, and this
-auto-refocus itself) are never mistaken for genuine user focus changes,
-so they can't corrupt the history that later tucks depend on; see
-`window/focus_history.lua` for exactly how. `input.focusHistorySize`
-(default 10) controls how many recent windows are remembered; 2 is the
-strict minimum this feature needs, the rest is headroom so one stale or
-now-invalid entry doesn't prevent falling back to the next valid one.
+1. Everything needed (frame, thumbnail, identity) is captured while A is
+   still on screen.
+2. The previous window is chosen **by window ID**: the window genuinely
+   focused immediately before A, taken from Tuck's focus history (fed by
+   the documented `windowFocused` window-filter event). Only if the
+   history has no usable entry does Tuck fall back to what
+   MinimizeToPrevious uses: the next visible standard window behind A in
+   the front-to-back order (`hs.window.orderedWindows()`), skipping A's own
+   application so a sibling is never picked arbitrarily.
+3. That exact window is raised and focused.
+4. Only then is A hidden/minimized. Nothing is focused afterwards.
+
+A candidate must still exist, be visible, not itself be tucked, and not be
+on a Space that is not currently showing (focusing it would pull you to
+that Space). If the hide fails, no tuck is recorded and focus goes back to
+A.
+
+- **Two different applications:** App A current, App B previous → B.
+- **Same application:** Safari A current, Safari B previous → B, by ID.
+- **Three same-app windows:** A previous, B current, C exists → tuck B →
+  A. C is never chosen.
+- **Multiple screens:** the exact previous window, wherever it is.
+- **Multiple Spaces:** windows on other Spaces and tucked windows are
+  skipped.
+- **No valid previous window:** focus is left alone; no sibling window or
+  other application is picked.
+
+Tuck's own focus calls (restoring a tucked window, and this refocus) are
+never recorded as user focus changes (`window/focus_history.lua`).
+`input.focusHistorySize` (default 10) bounds the history; 2 is the minimum.
 
 ## Untuck workflow
 
@@ -226,6 +234,25 @@ A card shows (each optional) a thumbnail captured at tuck time, the
 app's real icon (from its bundle, never a generic one), the app name, and
 the window title.
 
+**Rounded previews.** The screenshot is redrawn once, off-screen, through
+a rounded clip path (`hs.canvas` `clip`/`resetClip` +
+`canvas:imageFromCanvas()`), so the image itself has transparent rounded
+corners — no square corners, no background rectangle — and scaling it
+while the card animates never re-renders it. The radius is derived from
+`card.cornerRadius` (the card's radius minus the padding around the
+picture). Because a baked image scales its corners with it, the radius is
+tuned for the geometric mean of the compact and expanded sizes: slightly
+rounder than "ideal" when compact and slightly tighter when expanded.
+If baking fails, the plain snapshot is used and tucking is unaffected.
+
+**Inward-facing icon.** The app icon badge (shown over a thumbnail) sits
+on the side of the card facing the usable screen: bottom-right on left
+rails, bottom-left on right rails, bottom-centre on top rails, top-centre
+on bottom rails. Only the icon moves; it uses percentage layout like the
+rest of the card, so it stays in place across parked, revealed, hovered and
+search-expanded states, and on a parked left/right card it sits on the edge
+side that stays on screen.
+
 **Left and right rails peek** (`rails.<edge>.peek`, on by default; top and
 bottom keep the classic fully-visible layout, and you can turn peek on for
 any edge). A card's *size never changes* by parking or revealing, only
@@ -236,29 +263,46 @@ changes either, so neighbours don't jump.
 | --- | --- | --- |
 | **Parked** | resting | `card.peekSize` px (default 8) |
 | **Edge reveal** | pointer in the trigger strip | `card.edgeRevealSize` px (default 40) |
-| **Hover / search match** | pointer over the card, or matched by a search | full card, expanded to `expandedWidth × expandedHeight`, anchored at the edge, growing inward, clamped to the screen |
+| **Hover / search match** | pointer over the revealed card, or matched by a search | full card, expanded to `expandedWidth × expandedHeight`, flush with the edge, growing inward, clamped to the screen |
 
 Hover and search expansion coexist: a card that is both stays expanded
 until both end.
 
-**Stable interaction.** No polling: one mouse-moved event tap (running
-only while a peek rail has cards; it never consumes events and clicks are
-never blocked) tests the pointer against each rail's trigger strip
-(`card.edgeTriggerSize` deep, default 64, deeper than the revealed cards;
-spanning only the rail's cards). Each rail reveals while the pointer is in
-its strip or over any of its cards, and retracts only after
-`card.revealGraceDelay` (default 0.18 s) with no pointer, so moving
-between cards or between a card and the strip cannot flicker. Cards grow
-inward, away from the pointer.
+**Stable interaction (no feedback loop).** The earlier reveal jitter came
+from deriving hover from the canvas' own mouse enter/exit events: a card
+sliding under a still pointer generated exit/enter events, which retargeted
+the animation, which generated more events. Hover is now derived only from
+the pointer position, tested against regions computed from each card's
+*target* geometry, never from its live animating frame:
 
-**Animation.** One shared, time-based animator (`card/animator.lua`)
-drives every move: progress comes from elapsed time (not step counts), so
-it is frame-rate independent; a new animation replaces the running one and
-continues from the card's *current* on-screen frame; nothing can write
-after it finishes; frames land exactly on target; and the ticker stops
-when nothing is animating. Card layouts are percentage-based, so content
-scales continuously while a card grows. `hs.canvas` has no documented
-native frame tween, so this is driven by an `hs.timer`.
+- one mouse-moved event tap (running only while a rail has cards; it never
+  consumes events, and clicks are unaffected) feeds all decisions;
+- the **edge trigger strip** (`card.edgeTriggerSize` deep, default 64,
+  deeper than the revealed cards, spanning only the rail's cards) is fixed
+  by the screen and slot layout, so it cannot move with a card;
+- a card is **entered** when the pointer is inside where the card
+  currently rests (parked sliver, or revealed slot once the rail is
+  revealed) and **left** only when the pointer leaves its larger expanded
+  frame, which is flush with the screen edge and therefore always contains
+  the slot it grew from (hysteresis);
+- at most one card is hovered; a pointer move computes all state changes
+  first and applies each once;
+- a rail retracts only after `card.revealGraceDelay` (default 0.18 s) with
+  no pointer in its strip or on its cards; re-entry cancels the retract.
+
+So: parked → (pointer enters strip) revealed → (pointer on a card)
+expanded, each one animation; resting at the edge changes nothing; moving
+away gives one return animation.
+
+**Animation.** One shared, time-based animator (`card/animator.lua`) owns
+every move, one animation per card: a new target supersedes the running
+one (continuing from the card's *current* on-screen frame), a request for
+the target already being approached is ignored, cancelled or replaced
+animations can never write again, a destroyed card's animation is
+cancelled, frames land exactly on target, progress comes from elapsed time
+(frame-rate independent, clamped, monotonic), and the ticker stops when
+nothing is animating. `hs.canvas` has no documented native frame tween, so
+this is driven by an `hs.timer`.
 
 Limitation: a parked card hangs partly outside its screen. If another
 display sits directly beyond that edge, the hidden part can appear on it;
@@ -349,18 +393,68 @@ window, or quitting its app, also removes the card. Tuck's own restores
 are told apart from manual ones with explicit guards (per app for
 unhide, per window for unminimize), not with delays.
 
-## Persistence / restart limitations
+## Persistence
 
-Tuck prioritizes runtime correctness over persistence across restarts.
-A window's identity is its live macOS/Hammerspoon window ID, which is
-**not** meaningfully durable across an application relaunch or a system
-restart. Rather than risk reattaching a saved tuck record to the wrong
-new window, Tuck's persistence (disabled by default) only ever writes
-an informational snapshot — application name, bundle ID, window title,
-screen/Space identity, and frame — and, on the next start, logs a
-one-line notice of how many windows were tucked in the previous session.
-**It never automatically restores anything from that snapshot.** If you
-need a window back after a restart, just re-tuck it.
+Tucks survive Hammerspoon restarts and reloads.
+
+**State file.** `state.json` beside the Spoon (`Tuck.spoon/state.json`,
+derived from where `init.lua` was loaded — not from the working directory;
+override the folder with `persistence.directory`). It is versioned
+(`"version": 1`) plain JSON: for each tuck `tuckID`, `windowID`, `pid`,
+`bundleID`, `appName`, `windowTitle`, original `frame`, `spaceID`,
+`screenUUID`, `edge`, rail `order`, and how it was hidden (`mechanism`).
+No window/canvas/image objects, timers, functions, hover, reveal, search or
+animation state are ever stored. Add `state.json`, `state.json.*` and
+`cache/` to your `.gitignore` if the Spoon lives in a repository.
+
+**When it is written.** Only when persistent state changes (tuck created,
+tuck ended by restore/manual unhide/destroyed window/quit, rail order
+change), coalesced into one write after `persistence.debounce` seconds
+(0.25), plus a final write on `stop()`. Never during animations. Writes are
+atomic: temp file, flush, close, rename over the old file.
+
+**Startup reconciliation.** On `start()` the file is loaded, validated and
+each record is matched against real windows:
+
+- the saved `windowID` is trusted only if it resolves to a window of the
+  *same process* (saved PID, same bundle ID) whose title or frame matches
+  the saved one;
+- otherwise a window is adopted only if exactly one window of that process
+  matches title **and** frame, is still hidden/minimized, and no other
+  record competes for it; several possible candidates → the record is
+  dropped (logged) and nothing is attached or hidden;
+- window still hidden/minimized → record, shelf slot, rail order and card
+  are rebuilt, **parked**, without unhiding anything;
+- window already visible (restored while Tuck was not running) → record
+  dropped, the window is left alone;
+- window/application gone (or the application was relaunched, so the saved
+  PID no longer exists) → record dropped.
+
+The cleaned state is persisted immediately. Reconciliation is idempotent:
+repeated reloads never duplicate records, cards, watchers, taps or timers.
+Safari window A's record is never attached to Safari window B merely
+because both are Safari.
+
+**Thumbnails.** App icons are re-read from the app bundle. When
+`persistence.persistThumbnails` is on (default) and Screen Recording is
+granted, each card's rounded preview is cached as `cache/<tuckID>.png`
+and reloaded after a restart; unreferenced cache files are removed. A
+missing/unreadable cache file never discards a tuck: the card appears with
+the normal blank preview, icon and name.
+
+**Corrupt or unsupported files.** An unparsable file, or one written by a
+newer schema, is renamed to `state.json.corrupt-<time>` /
+`state.json.unsupported-<time>`, a warning is logged, and Tuck starts
+empty and carries on. Individual invalid entries are skipped.
+
+**Limitations.** A saved window ID is not durable across an application
+relaunch or reboot, so tucks whose application was quit/relaunched are
+dropped rather than guessed at (the hidden windows of a quit application no
+longer exist anyway). If a tuck's window is identical in title and frame to
+another hidden window of the same application and its ID changed, it is
+dropped as ambiguous. A window moved to another Space while Tuck was
+stopped keeps its recorded Space. Set `persistence.enabled = false` to keep
+everything in memory only.
 
 ## Known limitations
 
@@ -408,6 +502,10 @@ need a window back after a restart, just re-tuck it.
 | `search.scope` | `"screenAndSpace"` | or `"space"` (all screens of the current Space) |
 | `animation.hoverDuration` / `revealDuration` / `reflowDuration` | `0.18` / `0.22` / `0.20` | seconds; `0` = instant |
 | `animation.easing` | `"easeOutCubic"` | or `"easeInOutCubic"`, `"linear"` |
+| `persistence.enabled` | `true` | keep tucks across restarts |
+| `persistence.directory` | Spoon directory | where `state.json` / `cache/` live |
+| `persistence.debounce` | `0.25` | seconds writes are coalesced |
+| `persistence.persistThumbnails` | `true` | cache card previews in `cache/` |
 | `logging.level` | `"info"` | |
 
 **Migration.** Old keys are translated automatically: `shortcuts.untuck`
@@ -426,21 +524,21 @@ Tuck.spoon/
     state.lua              -- single command state machine: arrow = tuck, letters = search (pure Lua)
     matcher.lua             -- case-insensitive prefix matching (pure Lua)
   window/
-    manager.lua             -- capture/tuck/restore/forget, hide-vs-minimize choice, All-Spaces
+    manager.lua             -- capture/tuck/restore/forget, hide-vs-minimize choice, All-Spaces, focus-before-hide, startup reconcile
     tracker.lua              -- window filter (minimize/destroy/focus) + application watcher (hide/unhide/quit)
     focus_history.lua        -- pure MRU stack of genuinely-focused windows (pure Lua)
   space/
     manager.lua              -- current Space/screen resolution, watchers
     geometry.lua              -- pure rail-stacking + expansion math
   card/
-    manager.lua                -- canvases, parked/reveal/hover states, pointer model, click
+    manager.lua                -- canvases, parked/reveal/hover states, position-based pointer model, click
     animator.lua                -- shared time-based frame animator
     renderer.lua                -- builds a card's drawn elements from a TuckedWindow
-    preview.lua                  -- Screen Recording permission + snapshot capture
+    preview.lua                  -- Screen Recording permission, snapshot capture, rounded-corner baking, cache I/O
     icon.lua                      -- native app icon cache
   state/
     store.lua                     -- TuckState: windows index + shelves index
-    persistence.lua                -- optional, conservative session snapshot
+    persistence.lua                -- versioned state.json: validation, atomic debounced writes, thumbnail cache
   tests/                           -- see "Testing" below
   README.md
 ```
@@ -466,9 +564,15 @@ the source):
    off-screen, or resized.
 7. Tuck never fights a user's manual restoration of a tucked window.
 8. A hide-tucked window is the only tuck record of its application.
-9. Tucking always explicitly restores focus to the exact window
-   previously focused (or leaves focus alone) -- never an arbitrary
-   sibling window or application.
+9. Tucking focuses the exact window previously focused BEFORE hiding the
+   current one (or leaves focus alone) -- never an arbitrary sibling
+   window or application.
+10. Hover and edge reveal are decided from the pointer position against
+    target geometry, never from an animating canvas' frame or its mouse
+    enter/exit events.
+11. state.json holds only plain data; a bad file is preserved aside and
+    never crashes startup; a record is attached to a window only when it
+    can be identified unambiguously.
 
 ## Testing
 
@@ -494,9 +598,20 @@ leak, easing), and `integration_spec` (the real `init.lua` against
 same-app independence across screens/Spaces, manual unhide/unminimize,
 destroy and app quit, All-Spaces rejection, search scopes, parked/reveal/
 hover states on every edge, grace-delay stability, rapid hover, idempotent
-start/stop and no leaked taps/timers/watchers), and `focus_restore_spec`
-(the six focus-restoration scenarios above, end to end through the real
-tracker -> focus_history -> window.manager pipeline).
+start/stop and no leaked taps/timers/watchers), `focus_restore_spec`
+(the six focus-restoration scenarios, end to end through the real
+tracker -> focus_history -> window.manager pipeline), `persistence_spec`
+(state file contents/schema, debounced atomic writes, reload
+reconstruction of records/shelves/order/cards, no duplicates over repeated
+reloads, cleanup on restore/manual unhide/destroy/quit, reconciliation of
+visible/gone/ambiguous windows, same-app multi-window/screen/Space
+identity, thumbnail cache, corrupt/unsupported files, persistence off) and
+`behavior_spec` (focus-before-hide ordering and fallbacks, edge-reveal
+stability and absence of oscillation, hysteresis, animation ownership and
+cleanup, search expansion, inward icon placement for all four edges,
+rounded-thumbnail baking, restart-stable placement and search scope,
+single cleanup on restore, start/stop idempotency). Tests persist into
+temporary directories, never into the repository.
 
 The mock mirrors documented API signatures, not macOS behavior. Passing
 tests mean the logic and wiring are sound; they do **not** show that the
@@ -574,9 +689,39 @@ Hammerspoon on macOS:
 - [ ] Revoking Accessibility mid-session degrades gracefully (Tuck logs
   and shows feedback rather than crashing)
 
+**Focus after tucking**
+- [ ] Focus B, then A; tuck A → B is focused, and no other window of A's
+  application comes forward
+- [ ] Three windows of one application (A previous, B current, C other):
+  tuck B → A is focused, not C
+- [ ] Previous window on another screen / another Space behaves as
+  documented (no jump to a different Space)
+- [ ] No previous window: focus is left alone
+
+**Persistence**
+- [ ] Tuck several windows (several screens/Spaces/edges), reload
+  Hammerspoon: cards return parked, in the same order, on the right
+  screen and Space, windows stay hidden
+- [ ] Thumbnails return with Screen Recording granted; blank preview
+  without it
+- [ ] Manually restore a tucked window, reload: no card, window untouched
+- [ ] Quit a tucked app, reload: no card
+- [ ] Reload repeatedly: no duplicate cards, taps or timers
+- [ ] Corrupt `state.json` by hand: Hammerspoon starts, the file is kept
+  as `state.json.corrupt-*`
+
+**Card visuals**
+- [ ] Thumbnail corners are rounded (compact and expanded, no square
+  corners or rectangle behind them)
+- [ ] Icon: bottom-right on left cards, bottom-left on right cards,
+  inward on top/bottom cards
+
 **Card motion (look at it!)**
 - [ ] Parked left/right cards show only a small sliver
-- [ ] Approaching the edge slides cards smoothly to the reveal depth
+- [ ] Approaching the edge slides cards smoothly to the reveal depth, once;
+  holding the pointer at the edge does not jitter or repeat the animation
+- [ ] Pointer on the very first screen pixel over a card expands it and
+  stays expanded
 - [ ] Hovering a card expands it inward, smoothly, with no flicker
 - [ ] Rapid in/out and card-to-card movement stay smooth, no oscillation
 - [ ] Moving the pointer along the strip and away retracts once, after

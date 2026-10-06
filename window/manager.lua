@@ -32,6 +32,20 @@
 --   reveal a window that is still supposed to be tucked, and restoring a
 --   minimized sibling never needs the app to be unhidden.
 --
+-- FOCUS AFTER A TUCK (ported from MinimizeToPrevious.spoon)
+--   MinimizeToPrevious does not let macOS choose what comes to the front
+--   after a window leaves the screen: it finds the previous window,
+--   focuses it FIRST, and only then minimizes the target. Tuck does the
+--   same. Before anything is hidden it picks the window that was focused
+--   immediately before the one being tucked (exact window identity from
+--   window/focus_history.lua; if that history has no usable entry, the
+--   next window behind the target in the visible front-to-back order,
+--   hs.window.orderedWindows(), as MinimizeToPrevious uses -- but never a
+--   sibling window of the target's own application), focuses that exact
+--   window, and then hides the target. Because the previous window is
+--   already frontmost when the target disappears, macOS has nothing left
+--   to choose. With no valid previous window focus is simply left alone.
+--
 -- Also owns the internal-restore guards that distinguish a Spoon-
 -- initiated unminimize/unhide from a manual one (spec: "do not rely only on
 -- arbitrary time delays or sleeps to guess which unminimize caused the
@@ -65,6 +79,11 @@ function WindowManager.new(hsRef, store, cardManager, spaceManager, previewManag
   self.hideRestoring = {} -- appKey -> true while an internally-initiated unhide is in flight
   -- Set by init.lua: function() -> array of every known hs.window (all Spaces).
   self.listWindows = nil
+  -- Set by init.lua: function() invoked whenever persistent state changed
+  -- (tuck created, tuck ended, window destroyed, ...). Coalescing is the
+  -- receiver's job.
+  self.onStateChanged = nil
+  self.guardTimers = {} -- live safety-net timers, so stop() can cancel them
 
   return self
 end
@@ -72,10 +91,9 @@ end
 --- Is `windowID` an appropriate focus target: it still exists, is
 -- currently visible (not minimized, not part of a hidden application --
 -- focusing either would have unwanted side effects, like silently
--- un-minimizing an unrelated window), and is NOT itself a currently
--- tucked window (focusing a hidden/tucked window makes no sense; it
--- should already have been forgotten from history at tuck time, but this
--- is a cheap second guard).
+-- un-minimizing an unrelated window), is NOT itself a currently tucked
+-- window, and lives on a Space that is currently showing (focusing a
+-- window on an inactive Space would yank the user to that Space).
 function WindowManager:_isValidFocusTarget(windowID)
   if windowID == nil then
     return false
@@ -92,7 +110,133 @@ function WindowManager:_isValidFocusTarget(windowID)
   local okVis, visible = pcall(function()
     return win:isVisible()
   end)
-  return okVis and visible == true
+  if not okVis or visible ~= true then
+    return false
+  end
+  return self:_isOnActiveSpace(win)
+end
+
+--- True unless the window is known to be on a Space that is not showing.
+-- hs.spaces is experimental, so any failure to query it means "unknown",
+-- which does not disqualify the window.
+function WindowManager:_isOnActiveSpace(win)
+  local okSpaces, spaces = pcall(function()
+    return self.hs.spaces.windowSpaces(win)
+  end)
+  if not okSpaces or type(spaces) ~= "table" or #spaces == 0 then
+    return true
+  end
+  local okActive, active = pcall(function()
+    return self.hs.spaces.activeSpaces()
+  end)
+  if not okActive or type(active) ~= "table" then
+    return true
+  end
+  for _, sid in ipairs(spaces) do
+    for _, activeID in pairs(active) do
+      if activeID == sid then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+--- The window to refocus when `capture`'s window is tucked, as
+-- (hs.window, windowID) -- or nil when there is no valid previous window.
+--   1. the window focused immediately before it, per focus history;
+--   2. else the next visible standard window behind it in the
+--      front-to-back order (MinimizeToPrevious' definition of "previous"),
+--      skipping the target's own application so a sibling window is never
+--      chosen arbitrarily.
+function WindowManager:_choosePreviousWindow(capture)
+  if self.focusHistory then
+    local id = self.focusHistory:previousWindowID(capture.windowID, function(candidate)
+      return self:_isValidFocusTarget(candidate)
+    end)
+    if id ~= nil then
+      local ok, win = pcall(function()
+        return self.hs.window.get(id)
+      end)
+      if ok and win then
+        return win, id
+      end
+    end
+  end
+
+  local okList, ordered = pcall(function()
+    return self.hs.window.orderedWindows()
+  end)
+  if not okList or type(ordered) ~= "table" then
+    return nil
+  end
+  local targetIndex
+  for i, w in ipairs(ordered) do
+    local okID, wid = pcall(function()
+      return w:id()
+    end)
+    if okID and wid == capture.windowID then
+      targetIndex = i
+      break
+    end
+  end
+  if not targetIndex then
+    return nil
+  end
+  for i = targetIndex + 1, #ordered do
+    local w = ordered[i]
+    local okID, wid = pcall(function()
+      return w:id()
+    end)
+    if okID and wid ~= nil and self:_isValidFocusTarget(wid) then
+      local okStd, standard = pcall(function()
+        return w:isStandard()
+      end)
+      local okApp, wapp = pcall(function()
+        return w:application()
+      end)
+      local sameApp = false
+      if okApp and wapp then
+        local okP, wp = pcall(function()
+          return wapp:pid()
+        end)
+        sameApp = okP and capture.pid ~= nil and wp == capture.pid
+      end
+      if okStd and standard and not sameApp then
+        return w, wid
+      end
+    end
+  end
+  return nil
+end
+
+--- Run `fn` once after `seconds`, tracked so stop() can cancel it.
+function WindowManager:_guardAfter(seconds, fn)
+  local handle
+  handle = self.hs.timer.doAfter(seconds, function()
+    self.guardTimers[handle] = nil
+    fn()
+  end)
+  self.guardTimers[handle] = true
+  return handle
+end
+
+--- Cancel every pending safety-net timer (Spoon stop).
+function WindowManager:stop()
+  for handle in pairs(self.guardTimers) do
+    pcall(function()
+      handle:stop()
+    end)
+  end
+  self.guardTimers = {}
+  self.restoring = {}
+  self.hideRestoring = {}
+end
+
+function WindowManager:_notifyStateChanged()
+  if self.onStateChanged then
+    self.onStateChanged()
+  end
 end
 
 --- Bring `win` (with known `windowID`) to the front and focus it,
@@ -118,6 +262,13 @@ function WindowManager:_focusExactWindow(win, windowID)
   if ok then
     if self.focusHistory then
       self.focusHistory:record(windowID)
+      -- Safety net: if the OS never delivers the focus event we expected
+      -- (e.g. the window was already frontmost), the suppression must not
+      -- linger and swallow a later, genuine focus change.
+      local history = self.focusHistory
+      self:_guardAfter(RESTORE_GUARD_SAFETY_NET_SECONDS, function()
+        history:clearSuppression(windowID)
+      end)
     end
   else
     if self.focusHistory then
@@ -270,7 +421,7 @@ function WindowManager:capture(window)
 
   local thumbnail = nil
   if self.config.card.showThumbnail then
-    thumbnail = self.previewManager:capture(window, true)
+    thumbnail = self.previewManager:capture(window, true, self.config.card)
   end
 
   return {
@@ -461,18 +612,22 @@ function WindowManager:tuck(window, edge)
   record.mechanism = mechanism
   record.pid = capture.pid
 
-  -- Determine the window to restore focus to (the one focused
-  -- immediately before this one, per the tracked history) BEFORE hiding
-  -- anything, since hiding is about to change what's focused.
-  local previousWindowID = nil
-  if self.focusHistory then
-    previousWindowID = self.focusHistory:previousWindowID(capture.windowID, function(id)
-      return self:_isValidFocusTarget(id)
-    end)
+  -- MinimizeToPrevious order: decide the previous window and focus it
+  -- BEFORE hiding the current one, so macOS never gets to pick (and
+  -- activate) an arbitrary window when the current one disappears. The
+  -- thumbnail and every other piece of state were captured above, while
+  -- the window was still on screen (a hidden window cannot be captured).
+  local previousWindow, previousWindowID = self:_choosePreviousWindow(capture)
+  if previousWindow then
+    local okFocusPrev, focusPrevErr = self:_focusExactWindow(previousWindow, previousWindowID)
+    if not okFocusPrev then
+      if self.logger then
+        self.logger.w("Tuck: could not focus the previous window before tucking: " .. tostring(focusPrevErr))
+      end
+      previousWindow = nil
+    end
   end
 
-  -- Thumbnail and every other piece of state were captured above, BEFORE
-  -- the window leaves the screen (a hidden window cannot be captured).
   local okHide, err = pcall(function()
     if mechanism == "hide" then
       local ret = capture.appObject:hide()
@@ -485,6 +640,10 @@ function WindowManager:tuck(window, edge)
   if not okHide then
     -- Hiding failed: never create state for a window that was not
     -- actually hidden (never leave the model believing it was tucked).
+    -- Put focus back where it was, since we moved it ahead of the hide.
+    if previousWindow then
+      self:_focusExactWindow(window, capture.windowID)
+    end
     self:_feedback("Tuck failed: could not hide window (" .. tostring(err) .. ")")
     return false, err
   end
@@ -513,21 +672,7 @@ function WindowManager:tuck(window, edge)
     self.focusHistory:forget(record.windowID)
   end
 
-  -- Explicitly restore focus to the exact window that was focused before
-  -- this one -- never an arbitrary sibling window, never "whatever macOS
-  -- happens to pick" (which, after hiding/minimizing the focused window,
-  -- is not something Tuck controls or should rely on). If there is no
-  -- valid previous window, focus is deliberately left alone.
-  if previousWindowID ~= nil then
-    local prevWin = self.hs.window.get(previousWindowID)
-    if prevWin then
-      local okFocusPrev, focusPrevErr = self:_focusExactWindow(prevWin, previousWindowID)
-      if not okFocusPrev and self.logger then
-        self.logger.w("Tuck: could not restore focus to the previous window: " .. tostring(focusPrevErr))
-      end
-    end
-  end
-
+  self:_notifyStateChanged()
   return true
 end
 
@@ -584,7 +729,7 @@ function WindowManager:restore(tuckIDOrRecord)
 
     local key = appKey(record.pid, record.bundleID)
     self.hideRestoring[key] = true
-    hs.timer.doAfter(RESTORE_GUARD_SAFETY_NET_SECONDS, function()
+    self:_guardAfter(RESTORE_GUARD_SAFETY_NET_SECONDS, function()
       self.hideRestoring[key] = nil
     end)
     local okUnhide, unhideErr = pcall(function()
@@ -597,7 +742,7 @@ function WindowManager:restore(tuckIDOrRecord)
     end
   else
     self.restoring[windowID] = true
-    hs.timer.doAfter(RESTORE_GUARD_SAFETY_NET_SECONDS, function()
+    self:_guardAfter(RESTORE_GUARD_SAFETY_NET_SECONDS, function()
       self.restoring[windowID] = nil
     end)
     local okUnmin, unminErr = pcall(function()
@@ -670,6 +815,10 @@ function WindowManager:_cleanupRecord(record)
   end)
   if not okReflow and self.logger then
     self.logger.e("Tuck: reflow after cleanup failed: " .. tostring(reflowErr))
+  end
+
+  if removed then
+    self:_notifyStateChanged()
   end
 end
 
@@ -796,6 +945,237 @@ function WindowManager:handleAppTerminated(app)
   if pid or bundleID then
     self.hideRestoring[appKey(pid, bundleID)] = nil
   end
+end
+
+-- ---------------------------------------------------------------------
+-- Startup reconciliation (persisted tucks -> real windows)
+-- ---------------------------------------------------------------------
+
+local FRAME_TOLERANCE = 2 -- pixels
+
+local function framesClose(a, b)
+  return a and b
+    and math.abs(a.x - b.x) <= FRAME_TOLERANCE and math.abs(a.y - b.y) <= FRAME_TOLERANCE
+    and math.abs(a.w - b.w) <= FRAME_TOLERANCE and math.abs(a.h - b.h) <= FRAME_TOLERANCE
+end
+
+local function safe(fn)
+  local ok, v = pcall(fn)
+  if ok then
+    return v
+  end
+  return nil
+end
+
+--- The running application a persisted entry belongs to, or nil. The
+-- process ID must still exist AND be the same application (bundle ID).
+-- A changed process ID means the application was relaunched: its windows
+-- are new windows, so the old record is stale -- never re-attached by
+-- guesswork.
+function WindowManager:_applicationForEntry(entry)
+  if not entry.pid then
+    return nil
+  end
+  local app = safe(function()
+    return self.hs.application.applicationForPID(entry.pid)
+  end)
+  if not app then
+    return nil
+  end
+  if entry.bundleID then
+    local bundleID = safe(function()
+      return app:bundleID()
+    end)
+    if bundleID ~= entry.bundleID then
+      return nil
+    end
+  end
+  return app
+end
+
+--- Does live window `w` correspond to the persisted metadata? The
+-- window's title must match (when one was saved) or its frame must be the
+-- saved frame -- a window's frame does not change while it is tucked.
+local function metadataMatches(w, entry, requireBoth)
+  local title = safe(function()
+    return w:title()
+  end)
+  local frame = safe(function()
+    return w:frame()
+  end)
+  local titleOK = (entry.windowTitle == nil and title == nil) or (entry.windowTitle ~= nil and title == entry.windowTitle)
+  local frameOK = framesClose(frame, entry.frame)
+  if requireBoth then
+    return titleOK and frameOK
+  end
+  return titleOK or frameOK
+end
+
+--- Is the persisted window still in the state Tuck left it in?
+function WindowManager:_stillTucked(entry, app, w)
+  if entry.mechanism == "hide" then
+    return safe(function()
+      return app:isHidden()
+    end) == true
+  end
+  return safe(function()
+    return w:isMinimized()
+  end) == true
+end
+
+--- Reconcile persisted entries (array from Persistence:load()) against the
+-- real windows and rebuild runtime state for the ones that are still
+-- tucked. Idempotent: an entry whose tuckID/windowID is already tracked
+-- is skipped, so repeated calls never duplicate records or cards.
+--
+-- Per entry:
+--   * window resolved and still hidden/minimized -> record, shelf slot and
+--     card are rebuilt (parked); the window is NOT unhidden.
+--   * window resolved but already visible        -> manually restored
+--     while Tuck was not running: the record is dropped, the window is
+--     left alone.
+--   * application/window gone                    -> record dropped.
+--   * several windows could be it and the right one cannot be determined
+--     confidently                                 -> record dropped
+--     ("quarantined"), nothing is hidden or attached.
+-- A saved windowID is trusted only after the resolved window passes the
+-- metadata check (same application, plus matching title or frame). When it
+-- does not resolve, a window is matched by metadata only if exactly one
+-- unclaimed window of that process matches title AND frame, is still in the
+-- tucked state, and no other record competes for it.
+--
+-- `loadThumbnail(entry)` (optional) returns a cached hs.image or nil.
+-- Returns a summary table of counts.
+function WindowManager:reconcile(entries, loadThumbnail)
+  local summary = { restored = 0, staleVisible = 0, gone = 0, ambiguous = 0, duplicate = 0 }
+  local resolved = {} -- entry -> { win=, app= }
+  local claimed = {} -- windowID -> entry that owns it
+  local pending = {}
+
+  -- Stage 1: verified resolution by saved windowID.
+  for _, entry in ipairs(entries) do
+    if self.store:getByTuckID(entry.tuckID) or self.store:getByWindowID(entry.windowID) then
+      summary.duplicate = summary.duplicate + 1
+    else
+      local app = self:_applicationForEntry(entry)
+      if not app then
+        summary.gone = summary.gone + 1
+        if self.logger then
+          self.logger.d("Tuck: persisted tuck for " .. tostring(entry.appName) .. " dropped: application is gone")
+        end
+      else
+        local wins = safe(function()
+          return app:allWindows()
+        end) or {}
+        local found
+        for _, w in ipairs(wins) do
+          if safe(function()
+            return w:id()
+          end) == entry.windowID then
+            found = w
+            break
+          end
+        end
+        if found and metadataMatches(found, entry, false) and not claimed[entry.windowID] then
+          resolved[entry] = { win = found, app = app }
+          claimed[entry.windowID] = entry
+        else
+          pending[#pending + 1] = { entry = entry, app = app, windows = wins }
+        end
+      end
+    end
+  end
+
+  -- Stage 2: conservative metadata matching for entries whose saved
+  -- windowID did not verify.
+  local candidatesOf = {} -- pending item -> array of windows
+  local claimCount = {} -- candidate windowID -> number of pending entries wanting it
+  for _, item in ipairs(pending) do
+    local list = {}
+    for _, w in ipairs(item.windows) do
+      local wid = safe(function()
+        return w:id()
+      end)
+      if wid ~= nil and not claimed[wid] and metadataMatches(w, item.entry, true)
+        and self:_stillTucked(item.entry, item.app, w) then
+        list[#list + 1] = w
+      end
+    end
+    candidatesOf[item] = list
+    for _, w in ipairs(list) do
+      local wid = w:id()
+      claimCount[wid] = (claimCount[wid] or 0) + 1
+    end
+  end
+  for _, item in ipairs(pending) do
+    local list = candidatesOf[item]
+    if #list == 1 and claimCount[list[1]:id()] == 1 then
+      resolved[item.entry] = { win = list[1], app = item.app }
+      claimed[list[1]:id()] = item.entry
+    elseif #list == 0 then
+      summary.gone = summary.gone + 1
+      if self.logger then
+        self.logger.d("Tuck: persisted tuck for " .. tostring(item.entry.appName) .. " dropped: no matching window")
+      end
+    else
+      summary.ambiguous = summary.ambiguous + 1
+      if self.logger then
+        self.logger.w(string.format(
+          "Tuck: persisted tuck for %s (%s) matches %d windows; not attaching it to any of them",
+          tostring(item.entry.appName), tostring(item.entry.windowTitle), #list
+        ))
+      end
+    end
+  end
+
+  -- Stage 3: rebuild runtime state, in persisted rail order.
+  for _, entry in ipairs(entries) do
+    local res = resolved[entry]
+    if res then
+      if not self:_stillTucked(entry, res.app, res.win) then
+        summary.staleVisible = summary.staleVisible + 1
+        if self.logger then
+          self.logger.d("Tuck: persisted tuck for " .. tostring(entry.appName) .. " dropped: window is already visible")
+        end
+      else
+        local windowID = safe(function()
+          return res.win:id()
+        end)
+        local thumbnail = loadThumbnail and loadThumbnail(entry) or nil
+        local record = {
+          tuckID = entry.tuckID,
+          windowID = windowID,
+          pid = entry.pid,
+          bundleID = entry.bundleID,
+          appName = entry.appName,
+          windowTitle = entry.windowTitle,
+          frame = entry.frame,
+          screenUUID = entry.screenUUID,
+          spaceID = entry.spaceID,
+          edge = entry.edge,
+          order = entry.order,
+          mechanism = entry.mechanism,
+          thumbnail = thumbnail,
+          thumbnailFile = thumbnail and entry.thumbnailFile or nil,
+          state = "tucked",
+        }
+        self.store:addWindow(record)
+        summary.restored = summary.restored + 1
+      end
+    end
+  end
+
+  -- Cards for every rebuilt record (all start parked: no hover/reveal
+  -- state is ever restored).
+  if summary.restored > 0 then
+    local okCards, cardsErr = pcall(function()
+      self.cardManager:reflowAll()
+    end)
+    if not okCards and self.logger then
+      self.logger.e("Tuck: card reconstruction failed (records kept): " .. tostring(cardsErr))
+    end
+  end
+  return summary
 end
 
 return WindowManager

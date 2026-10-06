@@ -102,6 +102,18 @@ M.defaults = {
     easing = "easeOutCubic",
   },
 
+  persistence = {
+    -- Directory holding state.json (and the cache/ folder). nil = the
+    -- Spoon's own directory, derived from where init.lua was loaded.
+    -- directory = nil,
+    -- Keep tucks across Hammerspoon restarts (state.json beside the Spoon).
+    enabled = true,
+    -- Seconds state changes are coalesced before one atomic write.
+    debounce = 0.25,
+    -- Also keep each card's preview image in the Spoon's cache/ folder.
+    persistThumbnails = true,
+  },
+
   logging = {
     level = "info", -- "debug" | "info" | "warning" | "error"
   },
@@ -323,6 +335,19 @@ function M.validate(cfg)
   end
   if cfg.animation.easing ~= "easeOutCubic" and cfg.animation.easing ~= "easeInOutCubic" and cfg.animation.easing ~= "linear" then
     return false, "configuration.animation.easing must be one of easeOutCubic|easeInOutCubic|linear"
+  end
+
+  if type(cfg.persistence) ~= "table" then
+    return false, "configuration.persistence must be a table"
+  end
+  if type(cfg.persistence.enabled) ~= "boolean" or type(cfg.persistence.persistThumbnails) ~= "boolean" then
+    return false, "configuration.persistence.enabled and .persistThumbnails must be booleans"
+  end
+  if cfg.persistence.directory ~= nil and type(cfg.persistence.directory) ~= "string" then
+    return false, "configuration.persistence.directory must be a string"
+  end
+  if type(cfg.persistence.debounce) ~= "number" or cfg.persistence.debounce < 0 then
+    return false, "configuration.persistence.debounce must be a non-negative number"
   end
 
   if type(cfg.logging) ~= "table" or not VALID_LOG_LEVELS[cfg.logging.level] then

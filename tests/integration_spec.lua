@@ -13,6 +13,15 @@ local MODULES = {
   "card.manager", "card.renderer", "card.animator", "window.tracker", "window.manager",
 }
 
+local ConfigDefaults = require("config.defaults")
+
+local function tmpDir()
+  local name = os.tmpname()
+  os.remove(name)
+  os.execute("mkdir -p '" .. name .. "'")
+  return name
+end
+
 local function boot(configure, prepare)
   package.loaded["tests.mock_hs"] = nil
   local hs = require("tests.mock_hs")
@@ -24,9 +33,8 @@ local function boot(configure, prepare)
     package.loaded[m] = nil
   end
   local Tuck = assert(loadfile("./init.lua"))():init()
-  if configure then
-    Tuck:configure(configure)
-  end
+  -- Every boot persists into its own temp directory, never the repo.
+  Tuck:configure(ConfigDefaults.merge({ persistence = { directory = tmpDir() } }, configure))
   Tuck:start()
   return hs, Tuck
 end
@@ -51,6 +59,14 @@ local function tuck(hs, win, edge)
 end
 
 local function settle(hs) hs._advance(0.6) end
+
+-- Move the pointer the way a user does: into the edge strip first (the
+-- rail reveals), then onto the revealed card.
+local function hoverAt(hs, y)
+  hs._sendMouseMove(50, y)
+  hs._advance(0.6)
+  hs._sendMouseMove(20, y)
+end
 
 local function frameOf(Tuck, win)
   local rec = Tuck.store:getByWindowID(win.id())
@@ -408,22 +424,24 @@ local function run()
     t.eq(frameOf(Tuck, r).x, 1440 - 8)
 
     -- hover the card: expands inward, anchored at the boundary
-    canvasL._fireMouse("mouseEnter")
+    hs._sendMouseMove(20, cy)
     settle(hs)
     local hv = frameOf(Tuck, l)
     t.eq(hv.w, 220); t.eq(hv.h, 160)
-    t.eq(hv.x, 8, "expanded card anchored at the left boundary and grown inward")
+    t.eq(hv.x, 0, "expanded card is flush with the left boundary and grown inward")
     t.isTrue(hv.x >= 0 and hv.y >= 0 and hv.x + hv.w <= 1440 and hv.y + hv.h <= 900, "stays inside the screen")
 
-    -- unhover with the pointer still in the strip: back to the reveal depth (no snap out)
-    canvasL._fireMouse("mouseExit")
+    -- hysteresis: moving inside the expanded card / strip keeps it expanded
+    hs._sendMouseMove(50, cy + 30)
     settle(hs)
-    local back = frameOf(Tuck, l)
-    t.eq(back.x + back.w, 40, "returns to edge reveal while the pointer stays near the edge")
-    -- pointer leaves: after the grace delay the rail parks again
+    t.eq(frameOf(Tuck, l).w, 220, "pointer inside the expanded frame keeps the card expanded")
+    -- pointer leaves: the card collapses to the reveal depth, and after the
+    -- grace delay the rail parks again
     hs._sendMouseMove(700, 400)
     settle(hs)
-    t.eq(frameOf(Tuck, l).x + 72, 40, "not retracted before the grace delay")
+    local back = frameOf(Tuck, l)
+    t.eq(back.w, 72, "card collapses once the pointer leaves")
+    t.eq(back.x + back.w, 40, "not retracted before the grace delay")
     hs._fireAllTimers()
     settle(hs)
     t.eq(frameOf(Tuck, l).x + 72, 8, "parked again after the grace delay")
@@ -475,7 +493,7 @@ local function run()
     local c = newWin(hs, "Gamma")
     tuck(hs, c, "left")
     local cc = canvasOf(Tuck, c)
-    cc._fireMouse("mouseEnter")
+    hoverAt(hs, cc.frame().y + 36)
     settle(hs)
     t.eq(cc.frame().w, 220, "hover already expanded")
     hs._focusedWindow = newWin(hs, "Finder3")
@@ -517,27 +535,24 @@ local function run()
     tuck(hs, a, "left"); tuck(hs, b, "left")
     settle(hs)
     local ca, cb = canvasOf(Tuck, a), canvasOf(Tuck, b)
-    local bBefore = #cb._writes()
-    ca._fireMouse("mouseEnter")
+    local ay = ca.frame().y
+    hs._sendMouseMove(20, ay + 36)
     settle(hs)
     t.eq(cb.frame().x + cb.frame().w, 40, "neighbour follows only the shared rail reveal")
     local bx = cb.frame().x
-    local ay = ca.frame().y
-    ca._fireMouse("mouseExit")
+    hs._sendMouseMove(700, 400)
+    hs._fireAllTimers()
     settle(hs)
-    t.eq(cb.frame().x, bx, "neighbour did not jump from hovering another card")
-    -- hovered AND search-matched: stays expanded until both end
-    hs._focusedWindow = newWin(hs, "Finder")
-    ca._fireMouse("mouseEnter")
-    shortcut(hs); letter(hs, "a")
-    -- unique match restores Alpha; use two-match query instead
+    t.eq(cb.frame().x + cb.frame().w, 8, "neighbour parks with the rail; it never jumped sideways")
+    t.isTrue(cb.frame().x ~= bx)
     Tuck:stop()
 
     local hs2, T2 = boot()
     local s1 = newWin(hs2, "Sa"); local s2 = newWin(hs2, "Sb"); local o = newWin(hs2, "Other")
     tuck(hs2, s1, "left"); tuck(hs2, s2, "left"); tuck(hs2, o, "left")
     hs2._focusedWindow = newWin(hs2, "Finder")
-    canvasOf(T2, s1)._fireMouse("mouseEnter")
+    settle(hs2) -- let the rail finish re-centring before aiming the pointer
+    hoverAt(hs2, canvasOf(T2, s1).frame().y + 36)
     shortcut(hs2); letter(hs2, "s")
     settle(hs2)
     t.eq(canvasOf(T2, s1).frame().w, 220); t.eq(canvasOf(T2, s2).frame().w, 220)
@@ -546,7 +561,7 @@ local function run()
     settle(hs2)
     t.eq(canvasOf(T2, s1).frame().w, 220, "still hovered -> stays expanded after the search ends")
     t.eq(canvasOf(T2, s2).frame().w, 72, "search-only card collapses")
-    canvasOf(T2, s1)._fireMouse("mouseExit")
+    hs2._sendMouseMove(700, 400)
     settle(hs2)
     t.eq(canvasOf(T2, s1).frame().w, 72)
     T2:stop()
@@ -559,10 +574,11 @@ local function run()
     tuck(hs, a, "left"); tuck(hs, b, "left")
     settle(hs)
     local ca, cb = canvasOf(Tuck, a), canvasOf(Tuck, b)
+    local ya, yb = ca.frame().y + 36, cb.frame().y + 36
     for i = 1, 40 do
-      ca._fireMouse("mouseEnter"); hs._advance(0.017)
-      ca._fireMouse("mouseExit"); cb._fireMouse("mouseEnter"); hs._advance(0.017)
-      cb._fireMouse("mouseExit"); hs._advance(0.01)
+      hs._sendMouseMove(20, ya); hs._advance(0.017)
+      hs._sendMouseMove(20, yb); hs._advance(0.017)
+      hs._sendMouseMove(700, 400); hs._advance(0.01)
     end
     t.isTrue(Tuck.cardManager.animator:activeCount() <= 2, "no animation pile-up")
     hs._sendMouseMove(700, 400)

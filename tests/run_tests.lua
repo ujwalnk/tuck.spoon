@@ -30,6 +30,8 @@ local suites = {
   { name = "animator_spec", fn = require("tests.animator_spec") },
   { name = "focus_restore_spec", fn = require("tests.focus_restore_spec") },
   { name = "integration_spec", fn = require("tests.integration_spec") },
+  { name = "persistence_spec", fn = require("tests.persistence_spec") },
+  { name = "behavior_spec", fn = require("tests.behavior_spec") },
 }
 
 local allPassed = true

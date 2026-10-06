@@ -7,7 +7,8 @@
 --- is exactly per-window, minimized otherwise) and a small card parks
 --- against the chosen screen edge. Press it, then letters, to search the
 --- tucked applications by name and bring one back exactly where it was.
---- Clicking a card restores it too.
+--- Clicking a card restores it too. Tucks are persisted beside the Spoon
+--- (state.json) and rebuilt after a Hammerspoon restart.
 ---
 --- See the repository README.md for full documentation, configuration
 --- options, and known limitations.
@@ -98,7 +99,6 @@ function obj:_build()
   end
 
   self.store = Store.new()
-  self.persistence = Persistence.new(hs, self.logger)
 
   self.spaceManager = SpaceManager.new(hs, self.logger)
   self.iconManager = IconManager.new(hs, self.logger)
@@ -109,6 +109,14 @@ function obj:_build()
     hs, self.store, self.cardManager, self.spaceManager, self.previewManager,
     self.logger, self.config, self.focusHistory
   )
+  -- Every change to persistent state (tuck created/ended, window destroyed,
+  -- ...) asks the persistence layer for one coalesced write. The layer is
+  -- created in :start() from the then-current configuration.
+  self.windowManager.onStateChanged = function()
+    if self.persistence then
+      self.persistence:schedule()
+    end
+  end
   self.tracker = Tracker.new(hs, self.logger)
   self.windowManager.listWindows = function()
     return self.tracker:allWindows()
@@ -372,11 +380,76 @@ end
 -- Public lifecycle
 -- ---------------------------------------------------------------------
 
+--- Seed focus history from the current front-to-back window order so the
+-- very first tuck after a (re)start already knows which window was
+-- focused before the current one. Oldest first, so the frontmost window
+-- ends up most recent.
+function obj:_seedFocusHistory()
+  self.focusHistory:clear()
+  local okList, ordered = pcall(function()
+    return hs.window.orderedWindows()
+  end)
+  if not okList or type(ordered) ~= "table" then
+    return
+  end
+  for i = #ordered, 1, -1 do
+    local okID, id = pcall(function()
+      return ordered[i]:id()
+    end)
+    if okID and id ~= nil and self.store:getByWindowID(id) == nil then
+      self.focusHistory:record(id)
+    end
+  end
+end
+
+--- Where state.json lives: configured directory, else the Spoon's own
+-- directory (derived from this file's location, never the working dir).
+function obj:_stateDirectory()
+  return self.config.persistence.directory or self.spoonPath
+end
+
+--- Load state.json and reconcile it against the real windows (see
+-- window/manager.lua :reconcile), rebuilding records and parked cards for
+-- tucks whose windows are still hidden, then persist the cleaned result.
+-- Idempotent: already-tracked records are skipped.
+function obj:_restorePersistedTucks()
+  local pcfg = self.config.persistence
+  self.persistence = Persistence.new(hs, self.logger, {
+    directory = self:_stateDirectory(),
+    enabled = pcfg.enabled,
+    debounce = pcfg.debounce,
+    persistThumbnails = pcfg.persistThumbnails,
+  })
+  self.persistence:bind(self.store, self.previewManager)
+
+  if not pcfg.enabled then
+    -- Without persistence a stop()/start() cycle keeps the in-memory
+    -- records; just rebuild their cards.
+    self.cardManager:reflowAll()
+    return
+  end
+
+  local entries, status = self.persistence:load()
+  local summary
+  if status == "ok" then
+    summary = self.windowManager:reconcile(entries, function(entry)
+      return self.persistence:loadThumbnail(entry)
+    end)
+    self.logger.i(string.format(
+      "Tuck: restored %d tuck(s) (%d already visible, %d gone, %d ambiguous dropped)",
+      summary.restored, summary.staleVisible, summary.gone, summary.ambiguous
+    ))
+  end
+  if status == "ok" or #self.store:allWindows() > 0 then
+    self.persistence:flush() -- persist the reconciled (cleaned) state
+  end
+end
+
 --- Tuck:start()
 --- Method
 --- Start the Spoon: bind shortcuts, start the window tracker and
---- Space/screen watchers, and (if a previous session's persistence
---- snapshot exists and persistence is enabled) log a one-line notice.
+--- Space/screen watchers, then rebuild any tucks saved in state.json
+--- whose windows are still hidden.
 --- Idempotent -- calling this more than once has no additional effect.
 function obj:start()
   if self._started then
@@ -404,11 +477,8 @@ function obj:start()
     self:_onSpaceChanged()
   end)
 
-  self.persistence:reportPreviousSession()
-
-  -- A restart after stop() (or a reload of the config with the same Lua
-  -- state) rebuilds cards for records that are still tucked.
-  self.cardManager:reflowAll()
+  self:_seedFocusHistory()
+  self:_restorePersistedTucks()
 
   self._started = true
   self.logger.i("Tuck: started")
@@ -418,11 +488,9 @@ end
 --- Tuck:stop()
 --- Method
 --- Stop the Spoon: unbind shortcuts, stop the tracker/watchers, cancel
---- all timers, and destroy every card canvas. TuckedWindow state itself
---- (the store) is intentionally left in memory only for the lifetime of
---- the Lua state; a fresh :start() after :stop() rebuilds cards for any
---- windows that remained minimized in the interim by calling
---- reflowAll(). Idempotent -- calling this on an already-stopped (or
+--- all timers, destroy every card canvas, and write the final state to
+--- state.json. A later :start() rebuilds tucks and cards from that file
+--- (reconciled against the real windows). Idempotent -- calling this on an already-stopped (or
 --- never-started) Spoon is a harmless no-op.
 function obj:stop()
   if not self._started then
@@ -441,11 +509,28 @@ function obj:stop()
   if self.spaceManager then
     self.spaceManager:stop()
   end
+  if self.windowManager then
+    self.windowManager:stop()
+  end
   if self.cardManager then
     self.cardManager:stop()
   end
   if self.inputStateMachine then
     self.inputStateMachine:reset()
+  end
+
+  -- Write the final state, then drop runtime records: while stopped the
+  -- window tracker is not watching, so the next :start() rebuilds
+  -- everything from state.json and reconciles it against reality.
+  if self.persistence then
+    if self.persistence.enabled then
+      self.persistence:flush()
+      self.store:clear()
+    end
+    self.persistence:stop()
+  end
+  if self.focusHistory then
+    self.focusHistory:clear()
   end
 
   self._started = false

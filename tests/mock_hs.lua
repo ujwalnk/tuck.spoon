@@ -139,6 +139,66 @@ M.settings = {
 }
 
 -- ------------------------------------------------------------------
+-- hs.json / hs.fs (real files under a temp directory, like the real APIs)
+-- ------------------------------------------------------------------
+local MiniJSON = require("tests.mini_json")
+M.json = {
+  encode = function(value, _pretty)
+    return MiniJSON.encode(value)
+  end,
+  decode = function(text)
+    local ok, result = pcall(MiniJSON.decode, text)
+    if ok then
+      return result
+    end
+    return nil -- the real hs.json.decode logs an error and returns nil
+  end,
+}
+
+local function shellQuote(path)
+  return "'" .. path:gsub("'", "'\\''") .. "'"
+end
+
+M.fs = {
+  attributes = function(path, attr)
+    local ok = os.execute("test -d " .. shellQuote(path))
+    if ok then
+      if attr == "mode" then
+        return "directory"
+      end
+      return { mode = "directory" }
+    end
+    local f = io.open(path, "rb")
+    if f then
+      f:close()
+      if attr == "mode" then
+        return "file"
+      end
+      return { mode = "file" }
+    end
+    return nil
+  end,
+  mkdir = function(path)
+    return os.execute("mkdir -p " .. shellQuote(path)) and true or nil
+  end,
+  dir = function(path)
+    local p = io.popen("ls -1 " .. shellQuote(path) .. " 2>/dev/null")
+    local names = {}
+    if p then
+      for line in p:lines() do
+        names[#names + 1] = line
+      end
+      p:close()
+    end
+    local i = 0
+    return function()
+      i = i + 1
+      return names[i]
+    end
+  end,
+}
+
+-- ------------------------------------------------------------------
 -- hs.screenRecordingState
 -- ------------------------------------------------------------------
 M.screenRecordingState = function(_shouldPrompt)
@@ -148,9 +208,41 @@ end
 -- ------------------------------------------------------------------
 -- hs.image
 -- ------------------------------------------------------------------
+local function makeImage(fields)
+  local img = fields or {}
+  img.__mockImage = true
+  img.size = function()
+    return { w = img.w or 128, h = img.h or 128 }
+  end
+  img.saveToFile = function(_self, path)
+    local f = io.open(path, "wb")
+    if not f then
+      return false
+    end
+    f:write(string.format("MOCKPNG %d %d %s", img.w or 0, img.h or 0, img.baked and "baked" or "raw"))
+    f:close()
+    return true
+  end
+  return img
+end
+M._makeImage = makeImage
+
 M.image = {
   imageFromAppBundle = function(bundleID)
-    return { __mockImage = true, bundleID = bundleID }
+    return makeImage({ bundleID = bundleID })
+  end,
+  imageFromPath = function(path)
+    local f = io.open(path, "rb")
+    if not f then
+      return nil
+    end
+    local text = f:read("a")
+    f:close()
+    local w, h, kind = text:match("^MOCKPNG (%d+) (%d+) (%a+)")
+    if not w then
+      return nil
+    end
+    return makeImage({ w = tonumber(w), h = tonumber(h), baked = kind == "baked", fromCache = path })
   end,
 }
 
@@ -301,6 +393,7 @@ end
 -- hs.canvas
 -- ------------------------------------------------------------------
 M._canvases = {}
+M._bakeLog = {} -- every off-screen thumbnail bake (elements + size)
 M.canvas = {
   windowLevels = { floating = 5, desktopIcon = 1 },
   new = function(frame)
@@ -340,6 +433,10 @@ M.canvas = {
           return c
         end
         return currentFrame
+      end,
+      imageFromCanvas = function(_self)
+        M._bakeLog[#M._bakeLog + 1] = { elements = elements, size = { w = currentFrame.w, h = currentFrame.h } }
+        return makeImage({ w = currentFrame.w, h = currentFrame.h, baked = true })
       end,
       _writes = function()
         return writes
@@ -425,8 +522,15 @@ M.spaces = {
   spacesForScreen = function(_screenUUID)
     return { 1 }
   end,
-  windowSpaces = function(_window)
-    return { 1 } -- single Space -- eligible
+  windowSpaces = function(window)
+    return (window and window._spaces) or { 1 } -- single Space -- eligible
+  end,
+  activeSpaces = function()
+    local out = {}
+    for _, sc in ipairs(M._screens) do
+      out[sc:getUUID()] = M._activeSpaces[sc:getUUID()] or 1
+    end
+    return out
   end,
   watcher = {
     new = function(fn)
@@ -565,7 +669,8 @@ function M._makeWindow(opts)
     application = function() return app end,
     title = function() return opts.title end,
     screen = function() return opts.screen or M._screens[1] end,
-    snapshot = function() return { __mockSnapshot = true } end,
+    snapshot = function() return makeImage({ w = 1600, h = 1000, snapshot = true }) end,
+    _spaces = opts.spaces,
     minimize = function()
       minimized = true
       M._fireWindowFilterEvent("windowMinimized", win, opts.appName)
@@ -614,9 +719,31 @@ function M._fireWindowFilterEvent(eventName, window, appName)
   end
 end
 
+M._zOrder = nil -- optional explicit front-to-back list of mock windows
+
 M.window = {
   focusedWindow = function() return M._focusedWindow end,
   get = function(id) return M._windows[id] end,
+  orderedWindows = function()
+    local out = {}
+    if M._zOrder then
+      for _, w in ipairs(M._zOrder) do
+        if M._windows[w.id()] and w.isVisible() then out[#out + 1] = w end
+      end
+      return out
+    end
+    local ids = {}
+    for id, w in pairs(M._windows) do
+      if w.isVisible() then ids[#ids + 1] = id end
+    end
+    table.sort(ids, function(a, b) return a > b end)
+    local focused = M._focusedWindow
+    if focused and focused.isVisible() then out[#out + 1] = focused end
+    for _, id in ipairs(ids) do
+      if M._windows[id] ~= focused then out[#out + 1] = M._windows[id] end
+    end
+    return out
+  end,
   filter = {
     windowMinimized = "windowMinimized",
     windowUnminimized = "windowUnminimized",
@@ -645,5 +772,27 @@ M.window = {
     end,
   },
 }
+
+--- Simulate Hammerspoon reloading its Lua state: every hs object created by
+-- the old Spoon (canvases, taps, timers, watchers, hotkeys, window-filter
+-- subscriptions) disappears WITHOUT the Spoon's stop() being called, while
+-- the real applications/windows keep existing.
+function M._simulateReload()
+  for _, c in ipairs(M._canvases) do
+    c.delete()
+  end
+  M._canvases = {}
+  M._eventtaps = {}
+  M._pendingTimers = {}
+  M._wfSubscribers = {}
+  for _, w in ipairs(M._appWatchers) do
+    w.running = false
+  end
+  M._appWatchers = {}
+  for _, hk in ipairs(M._hotkeys) do
+    hk.deleted = true
+  end
+  M._hotkeys = {}
+end
 
 return M

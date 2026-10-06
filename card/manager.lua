@@ -16,22 +16,37 @@
 --   and revealing only MOVE the card (its size never changes) and never
 --   change its position along the rail, so neighbours never jump.
 --
--- STABLE POINTER MODEL (no polling, no oscillation)
---   * One lightweight mouse-moved eventtap (running only while a peek rail
---     has cards) tests the pointer against each rail's trigger region.
---     A region is the edge strip `edgeTriggerSize` deep over the rail's
---     extent -- deeper than the revealed cards, so cards sliding inward
---     never move out from under the trigger.
---   * Each rail keeps a SET of pointer "sources" (its trigger region and
---     each hovered card). The rail is revealed while the set is non-empty.
---   * When the set becomes empty the rail retracts only after
---     `revealGraceDelay`; any re-entry in that window cancels it. Moving
---     between cards or between a card and the strip therefore never
---     flickers.
---   * Cards grow away from the pointer (inward), so expansion can never
---     cause the pointer to leave the card it just entered.
+-- STABLE POINTER MODEL (no polling, no feedback loop)
+--   Hover and edge reveal are decided ONLY from the pointer position,
+--   tested against regions that are computed from the rail's target
+--   geometry -- never from the live (animating) canvas frame, and never
+--   from canvas mouse enter/exit events. (Canvas tracking areas follow the
+--   canvas as it moves, so a card sliding under a stationary pointer used
+--   to emit exit/enter events that restarted the very animation that
+--   caused them. Those events are no longer used for hover at all; the
+--   canvas only reports clicks.)
+--   * One lightweight mouse-moved eventtap (running only while a rail has
+--     cards) feeds `_onMouseMoved`.
+--   * Edge trigger zone (peek rails): the strip `edgeTriggerSize` deep over
+--     the rail's extent. Fixed by the screen and the rail's slot layout, so
+--     it cannot move with a card; it is deeper than the revealed cards.
+--   * Card hover has HYSTERESIS: a card is entered when the pointer is
+--     inside its revealed/resting slot, and left only when the pointer is
+--     outside its (larger) expanded frame. The expanded frame of a peek
+--     rail is flush with the screen boundary, so it always contains the
+--     slot it grew from -- a pointer on the extreme edge pixels can never
+--     be "inside the resting card but outside the expanded card".
+--   * At most one card is hovered at a time; it keeps the hover until the
+--     pointer leaves its expanded frame (no flicker between overlapping
+--     neighbours).
+--   * Each rail keeps a SET of pointer "sources" (its trigger zone and its
+--     hovered card). The rail is revealed while the set is non-empty and
+--     retracts only after `revealGraceDelay`; any re-entry cancels it.
+--   * All of a pointer move's state changes are computed first and applied
+--     once, so a single move produces a single target per card.
 --
--- All motion goes through card/animator.lua (single ticker, time-based).
+-- All motion goes through card/animator.lua (single ticker, time-based,
+-- one animation per card, new target supersedes the old one).
 
 local geometry = require("space.geometry")
 local Renderer = require("card.renderer")
@@ -58,9 +73,11 @@ function CardManager.new(hsRef, store, spaceManager, iconManager, logger, config
   self.animator = Animator.new(hsRef, logger)
 
   self.canvases = {} -- tuckID -> hs.canvas
-  self.anchorFrames = {} -- tuckID -> fully-visible reference frame (expansion anchor)
+  self.anchorFrames = {} -- tuckID -> fully-visible slot frame (inset from the boundary)
+  self.expandAnchors = {} -- tuckID -> slot frame an expansion grows from (flush on peek rails)
   self.restFrames = {} -- tuckID -> resting (parked / revealed / full) frame
-  self.hovered = {} -- tuckID -> true
+  self.hovered = {} -- tuckID -> true (at most one entry)
+  self.hoveredID = nil
   self.searchMatched = {} -- tuckID -> true
 
   self.railInfo = {} -- railKey -> { screenUUID, spaceID, edge }
@@ -156,7 +173,9 @@ function CardManager:create(record)
   -- per-Space placement this Spoon needs.
   canvas:level(hs.canvas.windowLevels.floating)
   canvas:clickActivating(false)
-  canvas:canvasMouseEvents(true, true, true, false)
+  -- Clicks only (down/up). Enter/exit are deliberately NOT requested:
+  -- hover is derived from pointer position, see "STABLE POINTER MODEL".
+  canvas:canvasMouseEvents(true, true, false, false)
 
   local this = self
   local tuckID = record.tuckID
@@ -165,11 +184,7 @@ function CardManager:create(record)
     if not rec then
       return
     end
-    if event == "mouseEnter" then
-      this:_cardPointerEnter(rec)
-    elseif event == "mouseExit" then
-      this:_cardPointerExit(rec)
-    elseif event == "mouseUp" then
+    if event == "mouseUp" then
       if this.onCardClicked then
         local ok, err = pcall(this.onCardClicked, tuckID)
         if not ok and this.logger then
@@ -199,8 +214,12 @@ function CardManager:destroy(tuckID)
   end
   self.canvases[tuckID] = nil
   self.anchorFrames[tuckID] = nil
+  self.expandAnchors[tuckID] = nil
   self.restFrames[tuckID] = nil
   self.hovered[tuckID] = nil
+  if self.hoveredID == tuckID then
+    self.hoveredID = nil
+  end
   self.searchMatched[tuckID] = nil
   -- Drop it from every rail's pointer set so a vanished card can never
   -- hold a rail open.
@@ -217,18 +236,23 @@ end
 -- target frames
 -- ---------------------------------------------------------------------
 
+--- The frame the card occupies when expanded (hover / search match).
+function CardManager:_expandedFrame(record)
+  local tuckID = record.tuckID
+  local anchor = self.expandAnchors[tuckID] or self.anchorFrames[tuckID]
+  if not anchor then
+    return nil
+  end
+  local cardCfg = self.config.card
+  local screen = self:_screenForUUID(record.screenUUID)
+  local area = screen and self.spaceManager:areaForScreen(screen, self.config.screen.useWorkArea) or nil
+  return geometry.expandedFrame(anchor, record.edge, { w = cardCfg.expandedWidth, h = cardCfg.expandedHeight }, area)
+end
+
 function CardManager:_targetFrame(record)
   local tuckID = record.tuckID
-  if isExpanded(self, tuckID) and self.anchorFrames[tuckID] then
-    local cardCfg = self.config.card
-    local screen = self:_screenForUUID(record.screenUUID)
-    local area = screen and self.spaceManager:areaForScreen(screen, self.config.screen.useWorkArea) or nil
-    return geometry.expandedFrame(
-      self.anchorFrames[tuckID],
-      record.edge,
-      { w = cardCfg.expandedWidth, h = cardCfg.expandedHeight },
-      area
-    )
+  if isExpanded(self, tuckID) and (self.expandAnchors[tuckID] or self.anchorFrames[tuckID]) then
+    return self:_expandedFrame(record)
   end
   return self.restFrames[tuckID]
 end
@@ -292,19 +316,31 @@ function CardManager:reflowRail(screenUUID, spaceID, edge, kind)
     self.railPointer[railKey] = nil
   end
 
-  local anchors, rests
+  local anchors, rests, expandAnchors
   if #records > 0 then
     anchors = geometry.frameForRail(base)
-    local restParams = {}
-    for k, v in pairs(base) do
-      restParams[k] = v
+    local function variant(overrides)
+      local p = {}
+      for k, v in pairs(base) do
+        p[k] = v
+      end
+      for k, v in pairs(overrides) do
+        p[k] = v
+      end
+      return p
     end
-    restParams.depth = self:_restDepth(edge, self.railRevealed[railKey] == true)
-    rests = restParams.depth ~= nil and geometry.frameForRail(restParams) or anchors
+    local peek = self:_peekEnabled(edge)
+    local restDepth = self:_restDepth(edge, self.railRevealed[railKey] == true)
+    rests = restDepth ~= nil and geometry.frameForRail(variant({ depth = restDepth })) or anchors
+    -- A peek rail's expansion grows from a slot that is FLUSH with the
+    -- boundary (inset 0), so the expanded frame always contains the
+    -- parked/revealed slot the pointer entered through.
+    expandAnchors = peek and geometry.frameForRail(variant({ inset = 0 })) or anchors
   end
 
   for i, record in ipairs(records) do
     self.anchorFrames[record.tuckID] = anchors[i]
+    self.expandAnchors[record.tuckID] = expandAnchors[i]
     self.restFrames[record.tuckID] = rests[i]
     local isNew = self.canvases[record.tuckID] == nil
     if isNew then
@@ -398,36 +434,6 @@ function CardManager:_afterPointerChange(railKey)
   end
 end
 
-function CardManager:_pointerEnter(railKey, sourceID)
-  local set = self.railPointer[railKey]
-  if not set then
-    set = {}
-    self.railPointer[railKey] = set
-  end
-  set[sourceID] = true
-  self:_afterPointerChange(railKey)
-end
-
-function CardManager:_pointerExit(railKey, sourceID)
-  local set = self.railPointer[railKey]
-  if set then
-    set[sourceID] = nil
-  end
-  self:_afterPointerChange(railKey)
-end
-
-function CardManager:_cardPointerEnter(record)
-  self.hovered[record.tuckID] = true
-  self:_pointerEnter(self:_railKeyOfRecord(record), record.tuckID)
-  self:_applyCard(record.tuckID, "hover", true)
-end
-
-function CardManager:_cardPointerExit(record)
-  self.hovered[record.tuckID] = nil
-  self:_pointerExit(self:_railKeyOfRecord(record), record.tuckID)
-  self:_applyCard(record.tuckID, "hover", true)
-end
-
 -- ---- edge trigger regions (mouse-moved eventtap, no polling) ----------
 
 --- Is `point` inside the trigger region `zone` = { frame = {x,y,w,h} }?
@@ -475,23 +481,123 @@ function CardManager:_syncRailZone(railKey, screenUUID, spaceID, edge, records, 
   self:_updateMoveTap()
 end
 
-function CardManager:_onMouseMoved(point)
-  for railKey, zone in pairs(self.railZones) do
-    local inside = CardManager.pointInFrame(point, zone.frame)
-    if inside ~= zone.inside then
-      if inside then
-        -- Only react on the Space that is actually showing these cards.
-        local screen = self:_screenForUUID(zone.screenUUID)
-        local active = screen and self.spaceManager:currentSpaceID(screen)
-        if active == zone.spaceID then
-          zone.inside = true
-          self:_pointerEnter(railKey, "zone")
-        end
-      else
-        zone.inside = false
-        self:_pointerExit(railKey, "zone")
+--- Is `spaceID` the Space currently showing on `screenUUID`? Cards (and
+-- their trigger zones) only react on the Space they belong to.
+function CardManager:_spaceActive(screenUUID, spaceID)
+  local screen = self:_screenForUUID(screenUUID)
+  if not screen then
+    return false
+  end
+  return self.spaceManager:currentSpaceID(screen) == spaceID
+end
+
+--- The slot a pointer must be inside to START hovering `record`: where
+-- the card actually rests right now -- the parked sliver, the revealed
+-- slot once its rail IS revealed, the fully visible slot while a command
+-- shows every card. (Not the revealed slot of a still-parked rail: the
+-- pointer first reveals the rail, then hovers the card it can now see.)
+function CardManager:_enterRegion(record)
+  return self.restFrames[record.tuckID]
+end
+
+--- The region the pointer must LEAVE to stop hovering `record`: its
+-- expanded frame (larger than, and containing, the enter region).
+function CardManager:_exitRegion(record)
+  if self.config.card.expansionEnabled then
+    return self:_expandedFrame(record)
+  end
+  return self:_enterRegion(record)
+end
+
+--- Which card (if any) the pointer hovers, with hysteresis: the currently
+-- hovered card keeps the hover while the pointer is inside its expanded
+-- frame; otherwise the first card (in deterministic rail order) whose
+-- enter region contains the pointer wins.
+function CardManager:_hitTestHover(point)
+  local current = self.hoveredID and self.store:getByTuckID(self.hoveredID)
+  if current and self.canvases[current.tuckID] and self:_spaceActive(current.screenUUID, current.spaceID) then
+    local region = self:_exitRegion(current)
+    if region and CardManager.pointInFrame(point, region) then
+      return current.tuckID
+    end
+  end
+  for _, item in ipairs(self.store:orderedRecords()) do
+    local rec = item.record
+    if self.canvases[rec.tuckID] and self:_spaceActive(rec.screenUUID, rec.spaceID) then
+      local region = self:_enterRegion(rec)
+      if region and CardManager.pointInFrame(point, region) then
+        return rec.tuckID
       end
     end
+  end
+  return nil
+end
+
+function CardManager:_setSource(railKey, sourceID, present)
+  local set = self.railPointer[railKey]
+  if present then
+    if not set then
+      set = {}
+      self.railPointer[railKey] = set
+    end
+    set[sourceID] = true
+  elseif set then
+    set[sourceID] = nil
+  end
+end
+
+--- React to the pointer being at `point` (global screen coordinates).
+-- Computes every state change first, then applies each exactly once, so
+-- one pointer move yields at most one target per card.
+function CardManager:_onMouseMoved(point)
+  local touchedRails = {}
+
+  -- 1. Edge trigger zones.
+  for railKey, zone in pairs(self.railZones) do
+    local inside = CardManager.pointInFrame(point, zone.frame) and self:_spaceActive(zone.screenUUID, zone.spaceID)
+    if inside ~= zone.inside then
+      zone.inside = inside
+      self:_setSource(railKey, "zone", inside)
+      touchedRails[railKey] = true
+    end
+  end
+
+  -- 2. Card hover (single hovered card, with hysteresis).
+  local oldID = self.hoveredID
+  local newID = self:_hitTestHover(point)
+  local changedCards = {}
+  if newID ~= oldID then
+    if oldID then
+      self.hovered[oldID] = nil
+      local oldRec = self.store:getByTuckID(oldID)
+      if oldRec then
+        local rk = self:_railKeyOfRecord(oldRec)
+        self:_setSource(rk, oldID, false)
+        touchedRails[rk] = true
+      end
+      changedCards[#changedCards + 1] = oldID
+    end
+    self.hoveredID = newID
+    if newID then
+      self.hovered[newID] = true
+      local newRec = self.store:getByTuckID(newID)
+      if newRec then
+        local rk = self:_railKeyOfRecord(newRec)
+        self:_setSource(rk, newID, true)
+        touchedRails[rk] = true
+      end
+      changedCards[#changedCards + 1] = newID
+    end
+  end
+
+  -- 3. Apply: rails first (reveal/retract), then the hovered cards. The
+  -- animator ignores a request for the target a card is already heading
+  -- to, so a card touched by both steps is animated once.
+  for railKey in pairs(touchedRails) do
+    self:_afterPointerChange(railKey)
+  end
+  for _, tuckID in ipairs(changedCards) do
+    self:_applyCard(tuckID, "hover", true)
   end
 end
 
@@ -573,8 +679,10 @@ function CardManager:stop()
     self.canvases[tuckID] = nil
   end
   self.anchorFrames = {}
+  self.expandAnchors = {}
   self.restFrames = {}
   self.hovered = {}
+  self.hoveredID = nil
   self.searchMatched = {}
   self.railInfo = {}
   self.railRevealed = {}

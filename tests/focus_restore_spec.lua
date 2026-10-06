@@ -16,6 +16,15 @@ local MODULES = {
   "window.focus_history",
 }
 
+local ConfigDefaults = require("config.defaults")
+
+local function tmpDir()
+  local name = os.tmpname()
+  os.remove(name)
+  os.execute("mkdir -p '" .. name .. "'")
+  return name
+end
+
 local function boot(configure, prepare)
   package.loaded["tests.mock_hs"] = nil
   local hs = require("tests.mock_hs")
@@ -27,9 +36,7 @@ local function boot(configure, prepare)
     package.loaded[m] = nil
   end
   local Tuck = assert(loadfile("./init.lua"))():init()
-  if configure then
-    Tuck:configure(configure)
-  end
+  Tuck:configure(ConfigDefaults.merge({ persistence = { directory = tmpDir() } }, configure))
   Tuck:start()
   return hs, Tuck
 end
