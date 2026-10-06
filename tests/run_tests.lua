@@ -32,6 +32,7 @@ local suites = {
   { name = "integration_spec", fn = require("tests.integration_spec") },
   { name = "persistence_spec", fn = require("tests.persistence_spec") },
   { name = "behavior_spec", fn = require("tests.behavior_spec") },
+  { name = "lifecycle_spec", fn = require("tests.lifecycle_spec") },
 }
 
 local allPassed = true

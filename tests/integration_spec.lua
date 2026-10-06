@@ -41,8 +41,12 @@ end
 
 -- input helpers -------------------------------------------------------
 local K = { t = 17, left = 123, right = 124, down = 125, up = 126, escape = 53 }
-local function shortcut(hs) return hs._sendKeyDown({ keyCode = K.t, flags = { fn = true } }) end
-local function arrow(hs, name) return hs._sendKeyDown({ keyCode = K[name], flags = { fn = true } }) end
+local function shortcut(hs) return hs._pressHotkey({ "alt" }, "f3") end
+local function arrow(hs, name) return hs._sendKeyDown({ keyCode = K[name], flags = {} }) end
+local function click(Tuck, win)
+  local rec = Tuck.store:getByWindowID(win.id())
+  Tuck.cardManager.hitCanvases[rec.tuckID]._fireMouse("mouseUp")
+end
 local function esc(hs) return hs._sendKeyDown({ keyCode = K.escape, flags = {} }) end
 local function letter(hs, ch) return hs._sendKeyDown({ keyCode = 99, flags = {}, chars = ch }) end
 
@@ -113,7 +117,7 @@ local function run()
 
     -- restore via card click: unhide, exact window front + focus, frame back
     win:setFrame({ x = 1, y = 2, w = 3, h = 4 }) -- drift while hidden
-    canvasOf(Tuck, win)._fireMouse("mouseUp")
+    click(Tuck, win)
     t.isFalse(win.application()._hidden, "unhidden")
     t.isTrue(win.isVisible())
     t.eq(hs._focusLog[#hs._focusLog], win.id(), "exact window focused")
@@ -601,15 +605,15 @@ local function run()
   do
     local hs, Tuck = boot()
     Tuck:start(); Tuck:start()
-    t.eq(#Tuck.shortcutManager.fnBindings, 1, "one shortcut binding")
-    t.eq(hs._runningTaps(10), 2, "shortcut tap + input tap only")
+    t.eq(#Tuck.shortcutManager.hotkeys, 1, "one shortcut binding")
+    t.eq(hs._runningTaps(10), 0, "idle: no keyboard tap at all")
     local win = newWin(hs, "Safari")
     tuck(hs, win, "left")
-    t.eq(hs._runningTaps(5), 1, "one mouse-move tap while a peek rail has cards")
+    t.eq(hs._runningTaps(5), 0, "no mouse tap while a peek rail has cards")
     Tuck:stop(); Tuck:stop()
     t.eq(hs._runningTaps(10), 0)
     t.eq(hs._runningTaps(5), 0)
-    t.isFalse(shortcut(hs), "Fn+T does nothing after stop()")
+    t.isFalse(shortcut(hs), "Option+F3 does nothing after stop()")
     t.eq(next(Tuck.cardManager.canvases), nil, "stop() removes every card")
     t.eq(#hs._wfSubscribers, 0, "window filter released")
     local live = 0
@@ -623,11 +627,14 @@ local function run()
     t.isFalse(pcall(function() Tuck:configure({ input = { commandTimeout = -5 } }) end))
     Tuck:stop()
     -- custom shortcut works, old separate shortcut is ignored
-    local hs2, T2 = boot({ shortcuts = { tuck = { mods = { "fn" }, key = "s" }, untuck = { mods = { "cmd" }, key = "t" } } })
+    local hs2, T2 = boot({ shortcuts = { tuck = { mods = { "cmd", "shift" }, key = "s" }, untuck = { mods = { "cmd" }, key = "t" } } })
     local hkCount = 0
     for _, hk in ipairs(hs2._hotkeys) do if not hk.deleted then hkCount = hkCount + 1 end end
-    t.eq(hkCount, 0, "no separate untuck hotkey is registered")
+    t.eq(hkCount, 1, "exactly one hotkey: the old separate untuck shortcut is ignored")
+    t.isTrue(hs2._pressHotkey({ "cmd", "shift" }, "s"), "the configured shortcut is the one bound")
     T2:stop()
+    -- an Fn-based configuration is refused with a clear error
+    t.isFalse(pcall(function() Tuck:configure({ shortcuts = { tuck = { mods = { "fn" }, key = "t" } } }) end), "fn is rejected")
   end
 
   t.report("integration_spec")

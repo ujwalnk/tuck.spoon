@@ -122,8 +122,14 @@ end
 -- and `onSpaceChanged` are callbacks with no arguments; the owner is
 -- expected to re-resolve shelf membership/visibility itself using the
 -- other methods on this manager (this module never touches tuck state).
+function SpaceManager:isRunning()
+  return self._screenWatcher ~= nil
+end
+
 function SpaceManager:start(onScreensChanged, onSpaceChanged)
-  self:stop() -- idempotent: never double-register watchers
+  if self._screenWatcher then
+    return -- idempotent: never double-register watchers
+  end
   local hs = self.hs
 
   self.onScreensChanged = onScreensChanged

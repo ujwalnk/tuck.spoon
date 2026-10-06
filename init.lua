@@ -2,7 +2,7 @@
 ---
 --- A per-Space, per-screen "tuck shelf" for macOS application windows.
 ---
---- One shortcut (default Fn+T) drives everything. Press it, then an arrow
+--- One shortcut (default Option+F3, a plain hs.hotkey) drives everything. Press it, then an arrow
 --- key to tuck the focused window: it is hidden (Cmd+H style where that
 --- is exactly per-window, minimized otherwise) and a small card parks
 --- against the chosen screen edge. Press it, then letters, to search the
@@ -10,8 +10,10 @@
 --- Clicking a card restores it too. Tucks are persisted beside the Spoon
 --- (state.json) and rebuilt after a Hammerspoon restart.
 ---
---- See the repository README.md for full documentation, configuration
---- options, and known limitations.
+--- Resource model: while idle (no tucks, no command) the Spoon owns only the
+--- activation hotkey. Everything else -- keyboard capture, window/app/screen/
+--- Space watchers, card and hover canvases, animation ticker, persistence
+--- timer -- exists only while something needs it. See README.md / CLAUDE.md.
 
 local obj = {}
 obj.__index = obj
@@ -116,8 +118,12 @@ function obj:_build()
     if self.persistence then
       self.persistence:schedule()
     end
+    self:_syncResources()
   end
   self.tracker = Tracker.new(hs, self.logger)
+  self.windowManager.focusEventsActive = function()
+    return self.tracker:isRunning()
+  end
   self.windowManager.listWindows = function()
     return self.tracker:allWindows()
   end
@@ -126,6 +132,7 @@ function obj:_build()
   self.inputStateMachine = InputStateMachine.new()
 
   self.commandTimer = nil
+  self.inputTap = nil
 
   -- Card clicks flow through the state machine too (so a click during an
   -- active keyboard search correctly cancels/collapses the search), then
@@ -136,12 +143,6 @@ function obj:_build()
     this:_dispatch(res)
   end
 
-  self.tracker.onMinimized = function(_window, _appName)
-    -- No-op: our own tuck() flow handles the minimize path directly and
-    -- deterministically. This handler exists purely so the tracker's
-    -- documented minimum event set is honored and available for future
-    -- diagnostics; there is nothing additional to reconcile here.
-  end
   self.tracker.onUnminimized = function(window, _appName)
     this.windowManager:handleUnminimized(window)
   end
@@ -178,7 +179,7 @@ function obj:_cancelTimers()
 end
 
 --- (Re)start the single command timeout (shortcut accepted, and after
--- every accepted search letter).
+-- every accepted search letter). One-shot; exists only during a command.
 function obj:_startCommandTimer()
   if self.commandTimer then
     self.commandTimer:stop()
@@ -188,6 +189,20 @@ function obj:_startCommandTimer()
     this.commandTimer = nil
     this:_dispatch(this.inputStateMachine:timeoutFired())
   end)
+end
+
+--- Command mode begins: the temporary keyboard capture and the timeout
+-- exist from here until _endCommand().
+function obj:_beginCommand()
+  self:_startCommandTimer()
+  self:_ensureInputTap()
+end
+
+--- Command mode ended (tuck, restore, cancel, timeout, Esc, stop): every
+-- temporary resource is destroyed immediately.
+function obj:_endCommand()
+  self:_cancelTimers()
+  self:_teardownInputTap()
 end
 
 --- Candidate list for the current keyboard-search scope, honoring the
@@ -218,12 +233,12 @@ end
 
 --- Central dispatch: turns an input/state.lua instruction into concrete
 -- action against the window/card managers. Every input path (shortcuts,
--- the arrow/letter eventtap, and card clicks) funnels through here.
+-- the temporary command-mode eventtap, and card clicks) funnels through here.
 function obj:_dispatch(res)
   if not res or res.action == "none" then
     return
   elseif res.action == "startCommandTimer" then
-    self:_startCommandTimer()
+    self:_beginCommand()
     -- Bring every tucked card fully on-screen while the command is open,
     -- so the user can see everything tucked before choosing an arrow or
     -- typing a search letter.
@@ -236,19 +251,19 @@ function obj:_dispatch(res)
     end
     self.cardManager:setSearchMatches(tuckIDs)
   elseif res.action == "tuck" then
-    self:_cancelTimers()
+    self:_endCommand()
     self.cardManager:setCommandRevealActive(false)
     local win = hs.window.focusedWindow()
     self.windowManager:tuck(win, res.edge)
   elseif res.action == "restore" then
-    self:_cancelTimers()
+    self:_endCommand()
     self.cardManager:setCommandRevealActive(false)
     if res.collapseSearch then
       self.cardManager:clearSearchExpansion()
     end
     self.windowManager:restore(res.tuckID)
   elseif res.action == "cancel" then
-    self:_cancelTimers()
+    self:_endCommand()
     self.cardManager:setCommandRevealActive(false)
     if res.collapseSearch then
       self.cardManager:clearSearchExpansion()
@@ -260,12 +275,11 @@ end
 -- Global keyboard handling for direction-selection / app-letter search
 -- ---------------------------------------------------------------------
 
---- A single, always-present eventtap that only ever intercepts keys
--- while the input state machine is in its command state, and even then
--- only what the command uses: arrows (to tuck, before any search letter)
--- and bare letters (to search), plus Esc. Every other key, and every key
--- while idle, passes through untouched -- this Spoon never swallows
--- unrelated global keyboard events.
+--- The TEMPORARY command-mode keyboard capture. Created when a command
+-- starts (_beginCommand) and destroyed the moment it ends (_endCommand);
+-- it never exists while idle. It only intercepts what the command uses:
+-- arrows (to tuck, before any search letter), bare letters (to search)
+-- and Esc. Every other key passes through untouched.
 function obj:_ensureInputTap()
   if self.inputTap then
     return
@@ -362,45 +376,52 @@ function obj:_onScreensChanged()
 end
 
 function obj:_onSpaceChanged()
-  -- Cards are ordinary (non-canJoinAllSpaces) canvases, so macOS itself
-  -- only shows each card on the Space it was created on; there is
-  -- nothing further this Spoon needs to do to hide/show cards across a
-  -- Space switch. We still reflow so any pending geometry recalculation
-  -- (e.g. from a config change) is applied to the newly-active Space's
-  -- shelves.
+  -- Cards are ordinary (non-canJoinAllSpaces) canvases, so macOS shows
+  -- each only on its own Space and nothing needs repositioning. What can
+  -- go stale is transient pointer state: a canvas on the Space we just
+  -- left may never deliver its mouse-exit. Reset it (cards park; no
+  -- record or persisted data is touched).
   local ok, err = pcall(function()
-    self.cardManager:reflowAll()
+    self.cardManager:resetInteraction()
   end)
   if not ok and self.logger then
     self.logger.e("Tuck: error reconciling after Space change: " .. tostring(err))
   end
 end
 
+--- Start/stop everything that is only needed while windows are tucked.
+-- Called whenever the set of tucks changes. Idempotent.
+--   * tucks exist  -> window filter + application watcher (tracker) and
+--                     the screen/Space watchers are running;
+--   * no tucks     -> all of them are stopped, caches are released and the
+--                     Spoon is back to "activation hotkey only".
+function obj:_syncResources()
+  if not self._started then
+    return
+  end
+  if self.store:count() > 0 then
+    if not self.tracker:isRunning() then
+      self.tracker:start()
+    end
+    if not self.spaceManager:isRunning() then
+      self.spaceManager:start(function()
+        self:_onScreensChanged()
+      end, function()
+        self:_onSpaceChanged()
+      end)
+    end
+  else
+    self.tracker:stop()
+    self.spaceManager:stop()
+    self.focusHistory:clear()
+    self.iconManager:clear()
+    self.cardManager:releaseIdleResources()
+  end
+end
+
 -- ---------------------------------------------------------------------
 -- Public lifecycle
 -- ---------------------------------------------------------------------
-
---- Seed focus history from the current front-to-back window order so the
--- very first tuck after a (re)start already knows which window was
--- focused before the current one. Oldest first, so the frontmost window
--- ends up most recent.
-function obj:_seedFocusHistory()
-  self.focusHistory:clear()
-  local okList, ordered = pcall(function()
-    return hs.window.orderedWindows()
-  end)
-  if not okList or type(ordered) ~= "table" then
-    return
-  end
-  for i = #ordered, 1, -1 do
-    local okID, id = pcall(function()
-      return ordered[i]:id()
-    end)
-    if okID and id ~= nil and self.store:getByWindowID(id) == nil then
-      self.focusHistory:record(id)
-    end
-  end
-end
 
 --- Where state.json lives: configured directory, else the Spoon's own
 -- directory (derived from this file's location, never the working dir).
@@ -426,6 +447,7 @@ function obj:_restorePersistedTucks()
     -- Without persistence a stop()/start() cycle keeps the in-memory
     -- records; just rebuild their cards.
     self.cardManager:reflowAll()
+    self:_syncResources()
     return
   end
 
@@ -440,16 +462,18 @@ function obj:_restorePersistedTucks()
       summary.restored, summary.staleVisible, summary.gone, summary.ambiguous
     ))
   end
-  if status == "ok" or #self.store:allWindows() > 0 then
+  if status == "ok" or self.store:count() > 0 then
     self.persistence:flush() -- persist the reconciled (cleaned) state
   end
+  self:_syncResources()
 end
 
 --- Tuck:start()
 --- Method
---- Start the Spoon: bind shortcuts, start the window tracker and
---- Space/screen watchers, then rebuild any tucks saved in state.json
---- whose windows are still hidden.
+--- Start the Spoon: bind the activation hotkey and rebuild any tucks saved
+--- in state.json whose windows are still hidden. Nothing else is created
+--- up front: watchers, hover canvases and keyboard capture appear only
+--- when tucks exist / a command is active.
 --- Idempotent -- calling this more than once has no additional effect.
 function obj:start()
   if self._started then
@@ -468,26 +492,16 @@ function obj:start()
     self:_dispatch(self.inputStateMachine:commandShortcutPressed())
   end)
 
-  self:_ensureInputTap()
-
-  self.tracker:start()
-  self.spaceManager:start(function()
-    self:_onScreensChanged()
-  end, function()
-    self:_onSpaceChanged()
-  end)
-
-  self:_seedFocusHistory()
+  self._started = true -- before restore: _syncResources is a no-op otherwise
   self:_restorePersistedTucks()
 
-  self._started = true
   self.logger.i("Tuck: started")
   return self
 end
 
 --- Tuck:stop()
 --- Method
---- Stop the Spoon: unbind shortcuts, stop the tracker/watchers, cancel
+--- Stop the Spoon: unbind the hotkey, stop the tracker/watchers, cancel
 --- all timers, destroy every card canvas, and write the final state to
 --- state.json. A later :start() rebuilds tucks and cards from that file
 --- (reconciled against the real windows). Idempotent -- calling this on an already-stopped (or
@@ -497,8 +511,7 @@ function obj:stop()
     return self
   end
 
-  self:_cancelTimers()
-  self:_teardownInputTap()
+  self:_endCommand()
 
   if self.shortcutManager then
     self.shortcutManager:unbindAll()
@@ -508,6 +521,9 @@ function obj:stop()
   end
   if self.spaceManager then
     self.spaceManager:stop()
+  end
+  if self.iconManager then
+    self.iconManager:clear()
   end
   if self.windowManager then
     self.windowManager:stop()

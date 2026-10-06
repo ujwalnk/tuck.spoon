@@ -51,18 +51,20 @@ local function run()
     Tuck:stop()
   end
 
-  -- ===== FOCUS: no history -> next window behind (never same-app sibling) =====
+  -- ===== FOCUS: no history (first tuck) -> the window directly behind, by focus recency =====
   do
     local hs, Tuck = H.boot()
-    local sibling = H.newWin(hs, "Safari", { title = "Sibling" })
     local behind = H.newWin(hs, "Mail", { title = "Behind" })
+    local sibling = H.newWin(hs, "Safari", { title = "Sibling" })
     local target = H.newWin(hs, "Safari", { title = "Target" })
-    hs._zOrder = { target, sibling, behind }
-    hs._focusedWindow = target -- focused without ever generating history
-    Tuck.focusHistory:clear()
+    local other = H.newWin(hs, "Notes", { title = "Other" })
+    hs._userFocus(behind); hs._userFocus(other); hs._userFocus(sibling); hs._userFocus(target)
+    t.isFalse(Tuck.tracker:isRunning(), "idle: no window filter exists yet")
+    hs._focusedWindow = target
     H.shortcut(hs); H.arrow(hs, "left")
-    t.eq(hs._focusedWindow.id(), behind.id(), "front-to-back fallback skips the same-app sibling")
-    t.isTrue(sibling.isVisible())
+    t.eq(hs._focusedWindow.id(), sibling.id(), "the window focused just before the target (z-order index 2), even same-app")
+    t.isTrue(other.isVisible() and behind.isVisible(), "no other window touched")
+    for _, a in ipairs(hs._activateLog) do t.isFalse(a.all, "never activate(allWindows=true)") end
     Tuck:stop()
   end
 
@@ -347,7 +349,7 @@ local function run()
     local cleanups = 0
     local orig = Tuck.windowManager._cleanupRecord
     Tuck.windowManager._cleanupRecord = function(self, rec) cleanups = cleanups + 1; return orig(self, rec) end
-    H.canvasOf(Tuck, a)._fireMouse("mouseUp")
+    H.click(Tuck, a)
     t.eq(cleanups, 1, "restore cleans up exactly once even though unminimize fires an event")
     t.eq(#Tuck.store:allWindows(), 1)
     Tuck:stop(); Tuck:stop(); Tuck:start(); Tuck:stop()

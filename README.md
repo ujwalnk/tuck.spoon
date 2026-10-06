@@ -8,7 +8,7 @@ its place, parked mostly off-screen until you approach the edge. Click
 the card, or type the app's name, to bring the window straight back to
 exactly where it was.
 
-**One shortcut does everything:** `Fn+T`, then an arrow to tuck, or
+**One shortcut does everything:** `Option+F3`, then an arrow to tuck, or
 letters to search and restore.
 
 Every screen/Space combination has its own independent set of shelves,
@@ -18,7 +18,7 @@ an external display, or on Space 2, or anywhere else.
 ## Requirements
 
 - Hammerspoon (current release; Tuck relies on `hs.canvas`,
-  `hs.window.filter`, `hs.spaces`, `hs.eventtap`, `hs.screen`, and
+  `hs.window.filter`, `hs.spaces`, `hs.hotkey`, `hs.eventtap` (command mode only), `hs.screen`, and
   `hs.image`).
 - macOS Accessibility permission for Hammerspoon (required for
   Hammerspoon to inspect/manipulate windows at all).
@@ -52,15 +52,15 @@ an external display, or on Space 2, or anywhere else.
 
 ```lua
 spoon.Tuck:start()   -- idempotent; safe to call more than once
-spoon.Tuck:stop()    -- idempotent; unbinds shortcuts, stops watchers,
-                     -- destroys every card canvas
+spoon.Tuck:stop()    -- idempotent; unbinds the hotkey, stops watchers,
+                     -- destroys every card canvas, writes final state
 ```
 
 ## Shortcut
 
 | Action | Default | Key |
 | --- | --- | --- |
-| Start a Tuck command (tuck **or** untuck) | `Fn+T` | `shortcuts.tuck` |
+| Start a Tuck command (tuck **or** untuck) | `Option+F3` | `shortcuts.tuck` |
 
 There is no separate untuck shortcut. **Pressing it also brings every
 currently tucked card fully into view** (still at its normal collapsed
@@ -68,7 +68,7 @@ size, not expanded) so you can see what's parked before choosing an
 arrow or typing a search letter; cards return to parked the moment the
 command ends (tuck, restore, cancel, or timeout).
 
-After `Fn+T`:
+After `Option+F3`:
 
 | Next key | Result |
 | --- | --- |
@@ -77,18 +77,22 @@ After `Fn+T`:
 | `Esc` | cancel |
 | (nothing for `input.commandTimeout`, default 1.5 s) | cancel |
 
-`Fn` is not a normal `hs.hotkey` modifier, so shortcuts containing
-`"fn"` use a shared `hs.eventtap`; that is internal. Only the exact
-shortcut is consumed; every other key passes through untouched.
+The activation shortcut is a plain `hs.hotkey`; it is the **only** thing
+Tuck keeps registered while idle. The keyboard capture that reads the
+arrow/letter/Esc follow-up is created when the command starts and
+destroyed the moment it ends (tuck, restore, cancel, Esc or timeout); it
+only consumes the keys the command uses and passes everything else
+through. `Fn` is **not** supported as a modifier (configuring it is a
+validation error). On a laptop keyboard, F3 needs *"Use F1, F2, etc. keys
+as standard function keys"* enabled in System Settings, or hold `fn` while
+pressing it; external keyboards need nothing.
 
-Notes: to search for an app starting with **T** while your shortcut is
-`Fn+T`, release `Fn` first (holding it re-triggers the shortcut). Once
-you have typed a search letter, arrow keys are ignored (they never
+Once you have typed a search letter, arrow keys are ignored (they never
 restore anything, and never tuck mid-search).
 
 ## Tuck workflow
 
-1. Press `Fn+T`.
+1. Press `Option+F3`.
 2. Press an arrow: **Left / Right / Up / Down** tucks the currently
    focused window to that rail.
 3. The window is captured (frame, app, icon, thumbnail), then hidden. Its
@@ -141,14 +145,19 @@ Order of operations when you tuck window A:
 
 1. Everything needed (frame, thumbnail, identity) is captured while A is
    still on screen.
-2. The previous window is chosen **by window ID**: the window genuinely
-   focused immediately before A, taken from Tuck's focus history (fed by
-   the documented `windowFocused` window-filter event). Only if the
-   history has no usable entry does Tuck fall back to what
-   MinimizeToPrevious uses: the next visible standard window behind A in
-   the front-to-back order (`hs.window.orderedWindows()`), skipping A's own
-   application so a sibling is never picked arbitrarily.
-3. That exact window is raised and focused.
+2. The previous window is chosen **by window ID**. While tucks exist,
+   Tuck's focus history (fed by the documented `windowFocused`
+   window-filter event) is authoritative. The window filter does not exist
+   while idle, so for the **first** tuck (and whenever the history has no
+   usable entry) Tuck uses the window directly behind A in
+   `hs.window.orderedWindows()` -- macOS keeps that list in focus-recency
+   order, so index 2 is the window focused before A (one enumeration at
+   tuck time, never polled). It is the same window MinimizeToPrevious
+   targets, and it may belong to A's own application: that is then
+   genuinely the previously focused window, not an arbitrary sibling.
+3. That exact window is raised and focused (the application is activated
+   with `activate()`, never `activate(true)`, which would raise *every*
+   window of the app).
 4. Only then is A hidden/minimized. Nothing is focused afterwards.
 
 A candidate must still exist, be visible, not itself be tucked, and not be
@@ -178,7 +187,7 @@ Restores that window immediately (even mid-search): app unhidden (or
 window unminimized), exact frame restored, exact window raised and
 focused, record and card removed, rail reflowed.
 
-### 2. Keyboard search: `Fn+T`, then letters
+### 2. Keyboard search: `Option+F3`, then letters
 
 Case-insensitive prefix match on the app name, within the search scope:
 
@@ -268,27 +277,37 @@ changes either, so neighbours don't jump.
 Hover and search expansion coexist: a card that is both stays expanded
 until both end.
 
-**Stable interaction (no feedback loop).** The earlier reveal jitter came
-from deriving hover from the canvas' own mouse enter/exit events: a card
-sliding under a still pointer generated exit/enter events, which retargeted
-the animation, which generated more events. Hover is now derived only from
-the pointer position, tested against regions computed from each card's
-*target* geometry, never from its live animating frame:
+**Event-driven, stable interaction (no polling, no feedback loop).** There
+is no mouse-moved eventtap and no timer that inspects the pointer. The
+earlier reveal jitter came from using the *moving* card's own mouse
+enter/exit events: a card sliding under a still pointer emitted exit/enter,
+which retargeted the animation, which emitted more events. Now:
 
-- one mouse-moved event tap (running only while a rail has cards; it never
-  consumes events, and clicks are unaffected) feeds all decisions;
-- the **edge trigger strip** (`card.edgeTriggerSize` deep, default 64,
-  deeper than the revealed cards, spanning only the rail's cards) is fixed
-  by the screen and slot layout, so it cannot move with a card;
-- a card is **entered** when the pointer is inside where the card
-  currently rests (parked sliver, or revealed slot once the rail is
-  revealed) and **left** only when the pointer leaves its larger expanded
-  frame, which is flush with the screen edge and therefore always contains
-  the slot it grew from (hysteresis);
-- at most one card is hovered; a pointer move computes all state changes
-  first and applies each once;
+- the visible card canvas has **no mouse callback** (it is click-through,
+  just a picture);
+- pointer events come from small **stationary sensor canvases**
+  (`canvasMouseEvents` enter/exit, which Hammerspoon delivers natively):
+  one **edge trigger zone** per peek rail (`card.edgeTriggerSize` deep,
+  default 64, spanning only the rail's cards) and one **hit canvas** per
+  card. A hit canvas covers the on-screen part of the card's current
+  *target* resting slot (parked sliver / revealed slot) and, while the card
+  is hovered, its expanded frame -- flush with the screen edge, so it always
+  contains the slot it grew from (hysteresis). Sensors are re-framed only
+  when a state changes, never per animation frame;
+- the hovered card's sensor is raised above its neighbours', so
+  overlapping slots cannot steal the hover; at most one card is hovered;
+- handlers are idempotent: a duplicate/stray enter or exit does nothing;
 - a rail retracts only after `card.revealGraceDelay` (default 0.18 s) with
-  no pointer in its strip or on its cards; re-entry cancels the retract.
+  no pointer in its zone or on its cards (a one-shot timer that exists only
+  while the rail is revealed and the pointer is away); re-entry cancels it;
+- **trade-off:** a Hammerspoon canvas that receives mouse events also
+  swallows clicks over its whole area, so clicks inside a rail's trigger
+  zone and on card slots go to Tuck rather than the window beneath. Lower
+  `card.edgeTriggerSize` (it must stay above `card.edgeRevealSize`) or set
+  `rails.<edge>.peek = false` if that strip matters to you. Away from the
+  shelf nothing is intercepted.
+- a Space change resets stale pointer state (cards park), because a sensor
+  on the Space just left may never deliver its exit.
 
 So: parked → (pointer enters strip) revealed → (pointer on a card)
 expanded, each one animation; resting at the edge changes nothing; moving
@@ -315,7 +334,7 @@ omit keeps its default. Example:
 
 ```lua
 spoon.Tuck:configure({
-  shortcuts = { tuck = { mods = { "fn" }, key = "t" } },   -- the ONE shortcut
+  shortcuts = { tuck = { mods = { "alt" }, key = "f3" } },   -- the ONE shortcut
   input = { commandTimeout = 1.5 },
   card = {
     showAppIcon = true, showThumbnail = true,
@@ -393,6 +412,35 @@ window, or quitting its app, also removes the card. Tuck's own restores
 are told apart from manual ones with explicit guards (per app for
 unhide, per window for unminimize), not with delays.
 
+## Resource model (CPU, battery, memory)
+
+Tuck is designed to do **no work while you are not using it**. Everything
+below is event-driven; the only recurring timer in the whole Spoon is the
+animation ticker, and it exists only while a card is moving.
+
+| State | What exists |
+| --- | --- |
+| **Idle** (no tucks, no command) | the activation hotkey, and nothing else: no eventtap, no timers, no window filter, no application/screen/Space watcher, no canvases, no icon cache |
+| **Command mode** | a temporary keyboard eventtap + one one-shot timeout timer, destroyed the instant the command resolves |
+| **Tucked, idle** | cards, sensor canvases, a window filter (unminimize / destroy / focus only), an application watcher (hide / unhide / quit), a screen watcher and a Space watcher. All are OS-event callbacks; none polls |
+| **Animating** | one `hs.timer.doEvery` ticker, stopped as soon as the last animation lands |
+| **Write pending** | one `doAfter` debounce timer (coalesces any number of changes), gone after the write |
+| **Last tuck removed** | back to *Idle*: watchers, filter, sensors, ticker, caches and focus history released |
+
+Also: the window filter is **not** subscribed to `windowMoved`,
+`windowTitleChanged` or `windowMinimized` (nothing uses them, and
+`windowMoved` fires continuously while any window is dragged); startup never
+enumerates windows; screenshots are taken once, at tuck time, never
+refreshed; the persisted state is read once at startup. Short one-shot
+safety-net timers (3 s) guard internal restore/focus flags and disappear on
+their own.
+
+Limitation of the lazy window filter: it starts at the first tuck, so it
+only learns about windows on other Spaces as they appear afterwards. The
+choice between "hide" and "minimize" (see above) therefore treats a window
+Tuck has not seen on another Space as non-existent for the *first* tuck of
+an app; hiding then also hides such a window until you restore the tuck.
+
 ## Persistence
 
 Tucks survive Hammerspoon restarts and reloads.
@@ -463,8 +511,8 @@ everything in memory only.
 - Hiding is app-level on macOS; per-window hiding does not exist, hence
   the hide/minimize split described above. Windows a hidden app opens
   while it is hidden are outside what Tuck can track.
-- While `Fn` is still held, `T` re-triggers the shortcut instead of
-  searching; release `Fn` before typing `T`.
+- Option+F3 is an ordinary hotkey: another application or macOS itself
+  may already use it; change `shortcuts.tuck` if so.
 - Only standard, single-Space application windows can be tucked
   (`hs.window:isStandard()`); unusual system overlays, transient
   dialogs Hammerspoon itself doesn't consider standard windows, and
@@ -482,7 +530,7 @@ everything in memory only.
 
 | Path | Default | Notes |
 | --- | --- | --- |
-| `shortcuts.tuck` | `{mods={"fn"}, key="t"}` | the only shortcut |
+| `shortcuts.tuck` | `{mods={"alt"}, key="f3"}` | the only shortcut (cmd/alt/shift/ctrl; no fn) |
 | `input.commandTimeout` | `1.5` | seconds; restarts after each accepted letter |
 | `card.showAppIcon` / `showThumbnail` / `showAppName` / `showWindowTitle` | `true`/`true`/`true`/`false` | |
 | `card.collapsedWidth` / `collapsedHeight` | `72` / `72` | card size **at the screen edge** (never changed by parking/reveal) |
@@ -520,12 +568,12 @@ Tuck.spoon/
   init.lua                 -- wiring, public start()/stop()/configure()
   config/defaults.lua      -- default config + validation (pure Lua)
   input/
-    shortcut.lua           -- hs.hotkey / hs.eventtap abstraction (Fn support)
+    shortcut.lua           -- hs.hotkey registration (no eventtap)
     state.lua              -- single command state machine: arrow = tuck, letters = search (pure Lua)
     matcher.lua             -- case-insensitive prefix matching (pure Lua)
   window/
     manager.lua             -- capture/tuck/restore/forget, hide-vs-minimize choice, All-Spaces, focus-before-hide, startup reconcile
-    tracker.lua              -- window filter (minimize/destroy/focus) + application watcher (hide/unhide/quit)
+    tracker.lua              -- window filter (unminimize/destroy/focus) + application watcher (hide/unhide/quit); runs only while tucks exist
     focus_history.lua        -- pure MRU stack of genuinely-focused windows (pure Lua)
   space/
     manager.lua              -- current Space/screen resolution, watchers
@@ -598,7 +646,10 @@ leak, easing), and `integration_spec` (the real `init.lua` against
 same-app independence across screens/Spaces, manual unhide/unminimize,
 destroy and app quit, All-Spaces rejection, search scopes, parked/reveal/
 hover states on every edge, grace-delay stability, rapid hover, idempotent
-start/stop and no leaked taps/timers/watchers), `focus_restore_spec`
+start/stop and no leaked taps/timers/watchers), `lifecycle_spec` (idle/command/tucked/animating/pending-write/last-tuck
+resource audit, event-driven hover, sensor stability, Space-change reset,
+unrelated-window integrity, garbage-collectability, lazy startup),
+`focus_restore_spec`
 (the six focus-restoration scenarios, end to end through the real
 tracker -> focus_history -> window.manager pipeline), `persistence_spec`
 (state file contents/schema, debounced atomic writes, reload
@@ -624,13 +675,13 @@ The following can only be verified by running Tuck inside real
 Hammerspoon on macOS:
 
 **Basic tuck / hiding**
-- [ ] `Fn+T` then each arrow tucks to the right rail
+- [ ] `Option+F3` then each arrow tucks to the right rail
 - [ ] Single-window app (e.g. VS Code): app hides like Cmd+H
 - [ ] Safari with several windows: only the chosen window disappears
   (minimized); the others stay visible
 - [ ] Terminal/iTerm2 with several windows behaves the same
 - [ ] Window is not moved off-screen and not resized
-- [ ] `Fn+T` then letters never tucks; `Fn+T` then an arrow never restores
+- [ ] `Option+F3` then letters never tucks; `Option+F3` then an arrow never restores
 
 **Restore**
 - [ ] Restore by clicking a card
@@ -697,6 +748,17 @@ Hammerspoon on macOS:
 - [ ] Previous window on another screen / another Space behaves as
   documented (no jump to a different Space)
 - [ ] No previous window: focus is left alone
+
+**Resource usage (Activity Monitor / `sudo powermetrics --samplers tasks`)**
+- [ ] Reload Hammerspoon with no tucks, leave it for a few minutes: no
+  Tuck-attributable wakeups (check in the Hammerspoon console:
+  `spoon.Tuck.tracker:isRunning()` is false, `spoon.Tuck.store:count()` is 0)
+- [ ] With tucks parked and the mouse idle: no recurring wakeups; moving the
+  mouse elsewhere on screen causes no Tuck work
+- [ ] Press Option+F3 and wait for the timeout: the keyboard tap is gone
+  (`spoon.Tuck.inputTap == nil`)
+- [ ] After an animation finishes `spoon.Tuck.cardManager.animator.ticker == nil`
+- [ ] Restore the last tuck: `spoon.Tuck.tracker:isRunning()` is false again
 
 **Persistence**
 - [ ] Tuck several windows (several screens/Spaces/edges), reload

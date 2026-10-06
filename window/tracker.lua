@@ -1,10 +1,13 @@
 --- Window lifecycle tracker.
 --
 -- A sensor, not the business-logic owner (per spec). Wraps a single
--- `hs.window.filter` instance and reports lifecycle events -- minimized,
--- unminimized, destroyed, focused, and (for reconciliation purposes)
--- moved and title-changed -- to callbacks supplied by the owner
--- (window/manager.lua). windowFocused feeds window/focus_history.lua so
+-- `hs.window.filter` instance and reports ONLY the lifecycle events Tuck
+-- acts on -- unminimized, destroyed and focused -- to callbacks supplied by
+-- the owner. (windowMinimized, windowMoved and windowTitleChanged are
+-- deliberately NOT subscribed: nothing consumes them, and windowMoved in
+-- particular fires continuously while any window is dragged.) The tracker
+-- exists only while at least one window is tucked (see init.lua
+-- :_syncResources). windowFocused feeds window/focus_history.lua so
 -- Tuck can restore focus to the exact window that was focused before the
 -- one just tucked (see that module for how it distinguishes genuine
 -- focus changes from Tuck's own internal ones).
@@ -31,11 +34,8 @@ function Tracker.new(hsRef, logger)
 
   -- Callbacks, each `function(window, appName)`. Set by the owner
   -- (window/manager.lua) before calling :start().
-  self.onMinimized = nil
   self.onUnminimized = nil
   self.onDestroyed = nil
-  self.onMoved = nil
-  self.onTitleChanged = nil
   self.onFocused = nil
 
   -- Application-level callbacks, each `function(app, appName)`. Hiding
@@ -56,10 +56,19 @@ local function safeCall(logger, label, fn, ...)
   end
 end
 
---- Start tracking. Idempotent: calling twice tears down and recreates
--- the underlying window filter rather than accumulating a second one.
+--- True while the window filter and application watcher exist.
+function Tracker:isRunning()
+  return self.wf ~= nil
+end
+
+--- Start tracking. Idempotent: a second call while running is a no-op
+-- (never a second filter). The owner (init.lua) starts the tracker only
+-- while at least one window is tucked and stops it when the last tuck
+-- ends, so an idle Spoon holds no window filter or application watcher.
 function Tracker:start()
-  self:stop()
+  if self.wf then
+    return
+  end
 
   local hs = self.hs
   local this = self
@@ -74,14 +83,6 @@ function Tracker:start()
     return
   end
   self.wf = wf
-
-  self.wf:subscribe(hs.window.filter.windowMinimized, function(window, appName)
-    safeCall(this.logger, "windowMinimized", function()
-      if this.onMinimized then
-        this.onMinimized(window, appName)
-      end
-    end)
-  end)
 
   self.wf:subscribe(hs.window.filter.windowUnminimized, function(window, appName)
     safeCall(this.logger, "windowUnminimized", function()
@@ -103,22 +104,6 @@ function Tracker:start()
     safeCall(this.logger, "windowFocused", function()
       if this.onFocused then
         this.onFocused(window, appName)
-      end
-    end)
-  end)
-
-  self.wf:subscribe(hs.window.filter.windowMoved, function(window, appName)
-    safeCall(this.logger, "windowMoved", function()
-      if this.onMoved then
-        this.onMoved(window, appName)
-      end
-    end)
-  end)
-
-  self.wf:subscribe(hs.window.filter.windowTitleChanged, function(window, appName)
-    safeCall(this.logger, "windowTitleChanged", function()
-      if this.onTitleChanged then
-        this.onTitleChanged(window, appName)
       end
     end)
   end)

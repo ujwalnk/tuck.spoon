@@ -257,6 +257,7 @@ M.keycodes = {
     down = 125,
     up = 126,
     t = 17,
+    f3 = 99,
     s = 1,
     a = 0,
   },
@@ -312,20 +313,6 @@ function M._sendKeyDown(spec)
     end
   end
   return consumed
-end
-
---- Test helper: simulate the pointer moving to (x, y).
-function M._sendMouseMove(x, y)
-  local event = {
-    location = function()
-      return { x = x, y = y }
-    end,
-  }
-  for _, tap in ipairs(M._eventtaps) do
-    if tap.running and tap.types[1] == 5 then
-      tap.fn(event)
-    end
-  end
 end
 
 function M._runningTaps(kind)
@@ -394,6 +381,7 @@ end
 -- ------------------------------------------------------------------
 M._canvases = {}
 M._bakeLog = {} -- every off-screen thumbnail bake (elements + size)
+M._zCounter = 0
 M.canvas = {
   windowLevels = { floating = 5, desktopIcon = 1 },
   new = function(frame)
@@ -401,7 +389,10 @@ M.canvas = {
     local currentFrame = { x = frame.x, y = frame.y, w = frame.w, h = frame.h }
     local elements = {}
     local deleted = false
+    local shown = false
     local writes = {}
+    local flags = { down = false, up = false, enterExit = false, move = false }
+    local z = 0
     local c
     c = {
       level = function(_self, _lvl)
@@ -410,7 +401,11 @@ M.canvas = {
       clickActivating = function(_self, _v)
         return c
       end,
-      canvasMouseEvents = function(_self, _down, _up, _enterExit, _move)
+      canvasMouseEvents = function(_self, down, up, enterExit, move)
+        if down ~= nil then flags.down = down end
+        if up ~= nil then flags.up = up end
+        if enterExit ~= nil then flags.enterExit = enterExit end
+        if move ~= nil then flags.move = move end
         return c
       end,
       mouseCallback = function(_self, fn)
@@ -418,10 +413,19 @@ M.canvas = {
         return c
       end,
       show = function(_self)
+        shown = true
+        M._zCounter = M._zCounter + 1
+        z = M._zCounter
+        return c
+      end,
+      bringToFront = function(_self)
+        M._zCounter = M._zCounter + 1
+        z = M._zCounter
         return c
       end,
       delete = function(_self)
         deleted = true
+        elements = {} -- a deleted canvas releases its images (as the real one does)
       end,
       replaceElements = function(_self, els)
         elements = els
@@ -443,11 +447,24 @@ M.canvas = {
       end,
       _fireMouse = function(event)
         if mouseCallback then
-          mouseCallback(c, event, 1, 0, 0)
+          mouseCallback(c, event, "_canvas_", 0, 0)
         end
+      end,
+      -- Mock-only introspection used by M._sendMouseMove.
+      _isSensor = function()
+        return mouseCallback ~= nil and shown and not deleted and flags.enterExit
+      end,
+      _isInteractive = function()
+        return mouseCallback ~= nil and shown and not deleted
+      end,
+      _z = function()
+        return z
       end,
       _isDeleted = function()
         return deleted
+      end,
+      _hasMouseCallback = function()
+        return mouseCallback ~= nil
       end,
       _elements = function()
         return elements
@@ -457,6 +474,59 @@ M.canvas = {
     return c
   end,
 }
+
+M._pointer = { x = -1e9, y = -1e9 }
+M._pointerOwner = nil -- canvas currently under the pointer (topmost interactive)
+
+--- Test helper: simulate the pointer moving to (x, y). Mirrors macOS
+-- tracking-area behaviour: the TOPMOST interactive canvas under the pointer
+-- receives mouseEnter, the previous owner receives mouseExit. Canvases
+-- without a mouse callback are click-through and never own the pointer.
+function M._sendMouseMove(x, y)
+  M._pointer = { x = x, y = y }
+  local top
+  for _, c in ipairs(M._canvases) do
+    if c._isSensor() then
+      local f = c.frame()
+      if x >= f.x and x < f.x + f.w and y >= f.y and y < f.y + f.h then
+        if not top or c._z() > top._z() then
+          top = c
+        end
+      end
+    end
+  end
+  local old = M._pointerOwner
+  if old == top then
+    return
+  end
+  M._pointerOwner = top
+  if old and not old._isDeleted() then
+    old._fireMouse("mouseExit")
+  end
+  if top then
+    top._fireMouse("mouseEnter")
+  end
+end
+
+--- Test helper: a click at (x, y) delivered to the topmost interactive
+-- canvas under it (none = click passes through to the app below).
+function M._click(x, y)
+  local top
+  for _, c in ipairs(M._canvases) do
+    if c._isInteractive() then
+      local f = c.frame()
+      if x >= f.x and x < f.x + f.w and y >= f.y and y < f.y + f.h then
+        if not top or c._z() > top._z() then
+          top = c
+        end
+      end
+    end
+  end
+  if top then
+    top._fireMouse("mouseUp")
+  end
+  return top ~= nil
+end
 
 -- ------------------------------------------------------------------
 -- hs.screen
@@ -487,6 +557,7 @@ function M._addScreen(uuid, frame)
   return sc
 end
 
+M._screenWatchers = {}
 M.screen = {
   allScreens = function()
     return M._screens
@@ -496,9 +567,11 @@ M.screen = {
   end,
   watcher = {
     new = function(fn)
+      local w = { running = false, fn = fn }
+      table.insert(M._screenWatchers, w)
       return {
-        start = function() end,
-        stop = function() end,
+        start = function() w.running = true end,
+        stop = function() w.running = false end,
         _fn = fn,
       }
     end,
@@ -514,6 +587,7 @@ M.mouse = {
 -- ------------------------------------------------------------------
 -- hs.spaces
 -- ------------------------------------------------------------------
+M._spaceWatchers = {}
 M._activeSpaces = {} -- screenUUID -> active space id (default 1)
 M.spaces = {
   activeSpaceOnScreen = function(screen)
@@ -534,9 +608,11 @@ M.spaces = {
   end,
   watcher = {
     new = function(fn)
+      local w = { running = false, fn = fn }
+      table.insert(M._spaceWatchers, w)
       return {
-        start = function() end,
-        stop = function() end,
+        start = function() w.running = true end,
+        stop = function() w.running = false end,
         _fn = fn,
       }
     end,
@@ -622,7 +698,10 @@ local function getApp(opts)
       end
       return true
     end,
-    activate = function() return true end,
+    activate = function(_self, allWindows)
+      M._activateLog[#M._activateLog + 1] = { pid = app and app._pid, all = allWindows == true }
+      return true
+    end,
     allWindows = function()
       local out = {}
       for _, w in ipairs(app._windows) do
@@ -665,7 +744,10 @@ function M._makeWindow(opts)
     isMinimized = function() return minimized end,
     isVisible = function() return (not minimized) and (not app._hidden) end,
     frame = function() return frame end,
-    setFrame = function(_self, f) frame = f end,
+    setFrame = function(_self, f)
+      frame = f
+      M._frameWrites[#M._frameWrites + 1] = id
+    end,
     application = function() return app end,
     title = function() return opts.title end,
     screen = function() return opts.screen or M._screens[1] end,
@@ -681,6 +763,7 @@ function M._makeWindow(opts)
     end,
     focus = function()
       M._focusedWindow = win
+      M._touchRecency(id)
       M._focusLog[#M._focusLog + 1] = id
       -- Real Hammerspoon fires windowFocused for any focus change,
       -- Tuck-initiated or not; the production suppression logic is what
@@ -698,6 +781,8 @@ function M._makeWindow(opts)
   return win
 end
 
+M._activateLog = {}
+M._frameWrites = {} -- ids of every window that was given a frame
 M._focusedWindow = nil
 M._focusLog = {}
 M._raiseLog = {}
@@ -720,11 +805,21 @@ function M._fireWindowFilterEvent(eventName, window, appName)
 end
 
 M._zOrder = nil -- optional explicit front-to-back list of mock windows
+M._focusRecency = {} -- window ids, most recently focused LAST (models macOS z-order)
+
+local function touchRecency(id)
+  for i = #M._focusRecency, 1, -1 do
+    if M._focusRecency[i] == id then table.remove(M._focusRecency, i) end
+  end
+  M._focusRecency[#M._focusRecency + 1] = id
+end
+M._touchRecency = touchRecency
 
 M.window = {
   focusedWindow = function() return M._focusedWindow end,
   get = function(id) return M._windows[id] end,
   orderedWindows = function()
+    M._enumerations = (M._enumerations or 0) + 1
     local out = {}
     if M._zOrder then
       for _, w in ipairs(M._zOrder) do
@@ -732,16 +827,17 @@ M.window = {
       end
       return out
     end
+    local seen = {}
+    for i = #M._focusRecency, 1, -1 do
+      local w = M._windows[M._focusRecency[i]]
+      if w and w.isVisible() and not seen[w.id()] then out[#out + 1] = w; seen[w.id()] = true end
+    end
     local ids = {}
     for id, w in pairs(M._windows) do
-      if w.isVisible() then ids[#ids + 1] = id end
+      if w.isVisible() and not seen[id] then ids[#ids + 1] = id end
     end
     table.sort(ids, function(a, b) return a > b end)
-    local focused = M._focusedWindow
-    if focused and focused.isVisible() then out[#out + 1] = focused end
-    for _, id in ipairs(ids) do
-      if M._windows[id] ~= focused then out[#out + 1] = M._windows[id] end
-    end
+    for _, id in ipairs(ids) do out[#out + 1] = M._windows[id] end
     return out
   end,
   filter = {
@@ -752,6 +848,7 @@ M.window = {
     windowMoved = "windowMoved",
     windowTitleChanged = "windowTitleChanged",
     new = function(_allowAll)
+      M._filtersCreated = (M._filtersCreated or 0) + 1
       return {
         subscribe = function(_self, eventName, fn)
           table.insert(M._wfSubscribers, { event = eventName, fn = fn })
@@ -789,6 +886,9 @@ function M._simulateReload()
     w.running = false
   end
   M._appWatchers = {}
+  for _, w in ipairs(M._screenWatchers) do w.running = false end
+  for _, w in ipairs(M._spaceWatchers) do w.running = false end
+  M._screenWatchers, M._spaceWatchers = {}, {}
   for _, hk in ipairs(M._hotkeys) do
     hk.deleted = true
   end

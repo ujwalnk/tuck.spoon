@@ -9,8 +9,15 @@ local function run()
   end
 
   t.isTrue(defaults.validate(D), "built-in defaults validate")
-  t.eq(D.shortcuts.tuck.key, "t")
-  t.eq(D.shortcuts.tuck.mods[1], "fn")
+  t.eq(D.shortcuts.tuck.key, "f3", "default activation key is F3")
+  t.eq(#D.shortcuts.tuck.mods, 1)
+  t.eq(D.shortcuts.tuck.mods[1], "alt", "default activation is Option+F3")
+  do
+    local ok, err = defaults.validate(defaults.merge(D, { shortcuts = { tuck = { mods = { "fn" }, key = "t" } } }))
+    t.isFalse(ok, "the fn modifier is rejected")
+    t.isTrue(tostring(err):find("fn", 1, true) ~= nil, "…with a message that names it")
+    t.isTrue(defaults.validate(defaults.merge(D, { shortcuts = { tuck = { mods = { "cmd", "alt" }, key = "space" } } })))
+  end
   t.isNil(D.shortcuts.untuck, "no separate untuck shortcut")
   t.eq(D.input.commandTimeout, 1.5)
   t.eq(D.search.scope, "screenAndSpace")
@@ -61,7 +68,7 @@ local function run()
       card = { animationDuration = 0.4 },
     })
     t.isNil(m.shortcuts.untuck, "old untuck shortcut is dropped")
-    t.eq(m.shortcuts.tuck.key, "t", "an empty shortcuts.{} after stripping untuck still merges through defaults")
+    t.eq(m.shortcuts.tuck.key, "f3", "an empty shortcuts.{} after stripping untuck still merges through defaults")
     t.eq(m.input.commandTimeout, 2.5, "directionTimeout migrates to commandTimeout")
     t.isNil(m.input.directionTimeout)
     t.eq(m.animation.hoverDuration, 0.4, "card.animationDuration migrates")

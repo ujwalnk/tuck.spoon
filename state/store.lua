@@ -187,6 +187,15 @@ function Store:windowsForSpace(spaceID, screenUUID)
   return out
 end
 
+--- Number of tucked windows (no allocation).
+function Store:count()
+  local n = 0
+  for _ in pairs(self.byTuckID) do
+    n = n + 1
+  end
+  return n
+end
+
 --- Every record in a stable, persistence-friendly order: shelf key, then
 -- edge, then rail position. Each returned entry is `{ record, order }`
 -- where `order` is the 1-based position on its rail.

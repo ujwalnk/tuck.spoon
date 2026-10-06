@@ -37,14 +37,28 @@
 --   after a window leaves the screen: it finds the previous window,
 --   focuses it FIRST, and only then minimizes the target. Tuck does the
 --   same. Before anything is hidden it picks the window that was focused
---   immediately before the one being tucked (exact window identity from
---   window/focus_history.lua; if that history has no usable entry, the
---   next window behind the target in the visible front-to-back order,
---   hs.window.orderedWindows(), as MinimizeToPrevious uses -- but never a
---   sibling window of the target's own application), focuses that exact
---   window, and then hides the target. Because the previous window is
---   already frontmost when the target disappears, macOS has nothing left
---   to choose. With no valid previous window focus is simply left alone.
+--   immediately before the one being tucked and focuses that exact window
+--   (never the application's "main window", never an app-wide activate),
+--   then hides the target. Because the previous window is already
+--   frontmost when the target disappears, macOS has nothing left to
+--   choose. With no valid previous window focus is simply left alone.
+--
+--   "Previous" comes from two sources, both by exact window identity:
+--     1. window/focus_history.lua, fed by windowFocused events. Those
+--        events exist only while the tracker runs, i.e. while at least
+--        one window is tucked (an idle Spoon has no window filter);
+--     2. otherwise (the very first tuck, before any tracker exists) the
+--        window directly behind the target in hs.window.orderedWindows():
+--        macOS keeps that list in focus-recency order, so index 2 is the
+--        window focused before the current one. One enumeration, at tuck
+--        time only, never polled.
+--
+-- UNRELATED WINDOWS ARE NEVER TOUCHED
+--   tuck() writes no frame at all. restore() writes the saved frame to
+--   exactly one window: the record's own, after checking it still belongs
+--   to the recorded process. Focusing never uses an app-wide "activate all
+--   windows" (hs.application:activate(true) raises EVERY window of the
+--   app, reshuffling windows the user never asked about).
 --
 -- Also owns the internal-restore guards that distinguish a Spoon-
 -- initiated unminimize/unhide from a manual one (spec: "do not rely only on
@@ -84,6 +98,9 @@ function WindowManager.new(hsRef, store, cardManager, spaceManager, previewManag
   -- receiver's job.
   self.onStateChanged = nil
   self.guardTimers = {} -- live safety-net timers, so stop() can cancel them
+  -- Set by init.lua: function() -> true while windowFocused events are
+  -- being delivered (the tracker is running). nil = assume yes.
+  self.focusEventsActive = nil
 
   return self
 end
@@ -146,9 +163,9 @@ end
 -- (hs.window, windowID) -- or nil when there is no valid previous window.
 --   1. the window focused immediately before it, per focus history;
 --   2. else the next visible standard window behind it in the
---      front-to-back order (MinimizeToPrevious' definition of "previous"),
---      skipping the target's own application so a sibling window is never
---      chosen arbitrarily.
+--      front-to-back order,
+--      (macOS orders windows by focus recency, so that IS the previously
+--      focused window; see "FOCUS AFTER A TUCK" at the top of this file).
 function WindowManager:_choosePreviousWindow(capture)
   if self.focusHistory then
     local id = self.focusHistory:previousWindowID(capture.windowID, function(candidate)
@@ -164,6 +181,8 @@ function WindowManager:_choosePreviousWindow(capture)
     end
   end
 
+  -- No usable history: the window directly behind the target in the
+  -- front-to-back (focus-recency) order. Standard windows only.
   local okList, ordered = pcall(function()
     return self.hs.window.orderedWindows()
   end)
@@ -192,17 +211,7 @@ function WindowManager:_choosePreviousWindow(capture)
       local okStd, standard = pcall(function()
         return w:isStandard()
       end)
-      local okApp, wapp = pcall(function()
-        return w:application()
-      end)
-      local sameApp = false
-      if okApp and wapp then
-        local okP, wp = pcall(function()
-          return wapp:pid()
-        end)
-        sameApp = okP and capture.pid ~= nil and wp == capture.pid
-      end
-      if okStd and standard and not sameApp then
+      if okStd and standard then
         return w, wid
       end
     end
@@ -246,15 +255,19 @@ end
 -- restore a tucked window and to return focus to whichever window was
 -- focused immediately before the one just tucked.
 function WindowManager:_focusExactWindow(win, windowID)
-  if self.focusHistory then
+  local events = self.focusEventsActive == nil or self.focusEventsActive()
+  if self.focusHistory and events then
     self.focusHistory:suppressNextFocus(windowID)
   end
   local ok, err = pcall(function()
+    -- Activate the application WITHOUT bringing all of its windows
+    -- forward (activate(true) would raise every sibling window), then
+    -- raise/focus exactly this window.
     local okApp, app = pcall(function()
       return win:application()
     end)
     if okApp and app then
-      app:activate(true)
+      app:activate()
     end
     win:raise()
     win:focus()
@@ -262,13 +275,16 @@ function WindowManager:_focusExactWindow(win, windowID)
   if ok then
     if self.focusHistory then
       self.focusHistory:record(windowID)
-      -- Safety net: if the OS never delivers the focus event we expected
-      -- (e.g. the window was already frontmost), the suppression must not
-      -- linger and swallow a later, genuine focus change.
-      local history = self.focusHistory
-      self:_guardAfter(RESTORE_GUARD_SAFETY_NET_SECONDS, function()
-        history:clearSuppression(windowID)
-      end)
+      if events then
+        -- Safety net: if the OS never delivers the focus event we
+        -- expected (e.g. the window was already frontmost), the
+        -- suppression must not linger and swallow a later, genuine focus
+        -- change. One-shot, only while events are being tracked.
+        local history = self.focusHistory
+        self:_guardAfter(RESTORE_GUARD_SAFETY_NET_SECONDS, function()
+          history:clearSuppression(windowID)
+        end)
+      end
     end
   else
     if self.focusHistory then
@@ -676,6 +692,28 @@ function WindowManager:tuck(window, edge)
   return true
 end
 
+--- Does `win` still belong to the process recorded for `record`? Unknown
+-- (no recorded pid / no readable pid) counts as belonging, so a quirky
+-- application cannot make restore fail; a KNOWN mismatch does not.
+function WindowManager:_belongsToRecord(win, record)
+  if not record.pid then
+    return true
+  end
+  local okApp, app = pcall(function()
+    return win:application()
+  end)
+  if not okApp or not app then
+    return true
+  end
+  local okPid, pid = pcall(function()
+    return app:pid()
+  end)
+  if not okPid or pid == nil then
+    return true
+  end
+  return pid == record.pid
+end
+
 --- THE single restore implementation. Accepts either a tuckID (string)
 -- or an already-resolved TuckedWindow record. Every restore path (card
 -- click, keyboard search, reconciliation) must call this.
@@ -755,13 +793,20 @@ function WindowManager:restore(tuckIDOrRecord)
     end
   end
 
-  -- Exact saved frame (failure is logged only: the window is restored
-  -- either way and a geometry hiccup must not corrupt state).
-  local okFrame, frameErr = pcall(function()
-    win:setFrame(record.frame)
-  end)
-  if not okFrame and self.logger then
-    self.logger.w("Tuck: could not restore exact frame for " .. tostring(record.appName) .. ": " .. tostring(frameErr))
+  -- Exact saved frame, written to THIS record's window only, and only
+  -- after confirming it still belongs to the recorded process (a frame is
+  -- never written to a window we merely resolved by a possibly reused
+  -- ID). Failure is logged only: the window is restored either way and a
+  -- geometry hiccup must not corrupt state.
+  if self:_belongsToRecord(win, record) then
+    local okFrame, frameErr = pcall(function()
+      win:setFrame(record.frame)
+    end)
+    if not okFrame and self.logger then
+      self.logger.w("Tuck: could not restore exact frame for " .. tostring(record.appName) .. ": " .. tostring(frameErr))
+    end
+  elseif self.logger then
+    self.logger.w("Tuck: resolved window no longer matches the tuck record for " .. tostring(record.appName) .. "; frame left untouched")
   end
 
   -- Front + focus THIS exact window (never "the app's main window").

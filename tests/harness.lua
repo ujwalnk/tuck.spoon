@@ -80,12 +80,13 @@ function H.newWin(hs, app, extra)
   return hs._makeWindow(o)
 end
 
+--- Press the activation shortcut (Option+F3) through the registered hotkey.
 function H.shortcut(hs)
-  return hs._sendKeyDown({ keyCode = H.K.t, flags = { fn = true } })
+  return hs._pressHotkey({ "alt" }, "f3")
 end
 
 function H.arrow(hs, name)
-  return hs._sendKeyDown({ keyCode = H.K[name], flags = { fn = true } })
+  return hs._sendKeyDown({ keyCode = H.K[name], flags = {} })
 end
 
 function H.esc(hs)
@@ -113,6 +114,14 @@ function H.canvasOf(Tuck, win)
   return Tuck.cardManager.canvases[rec.tuckID], rec
 end
 
+--- Click a card the way a user does: the topmost sensor under it gets the
+-- mouse-up. Returns true if some canvas consumed the click.
+function H.click(Tuck, win)
+  local rec = Tuck.store:getByWindowID(win.id())
+  local hit = Tuck.cardManager.hitCanvases[rec.tuckID]
+  hit._fireMouse("mouseUp")
+end
+
 function H.frameOf(Tuck, win)
   local c, rec = H.canvasOf(Tuck, win)
   return c.frame(), rec
@@ -126,7 +135,30 @@ function H.countKeys(tbl)
   return n
 end
 
+--- Live VISUAL card canvases (no mouse callback: they are click-through).
 function H.liveCanvases(hs)
+  local n = 0
+  for _, c in ipairs(hs._canvases) do
+    if not c._isDeleted() and not c._hasMouseCallback() then
+      n = n + 1
+    end
+  end
+  return n
+end
+
+--- Live sensor canvases (card hit canvases + rail trigger zones).
+function H.liveSensors(hs)
+  local n = 0
+  for _, c in ipairs(hs._canvases) do
+    if not c._isDeleted() and c._hasMouseCallback() then
+      n = n + 1
+    end
+  end
+  return n
+end
+
+--- Every live canvas of any kind.
+function H.allLiveCanvases(hs)
   local n = 0
   for _, c in ipairs(hs._canvases) do
     if not c._isDeleted() then
@@ -134,6 +166,36 @@ function H.liveCanvases(hs)
     end
   end
   return n
+end
+
+--- Snapshot of every resource that can wake the CPU or hold memory.
+function H.resources(hs)
+  local timers = { oneShot = 0, repeating = 0 }
+  for _, h in ipairs(hs._pendingTimers) do
+    if not h.stopped then
+      if h.repeating then timers.repeating = timers.repeating + 1 else timers.oneShot = timers.oneShot + 1 end
+    end
+  end
+  local function running(list)
+    local n = 0
+    for _, w in ipairs(list) do if w.running then n = n + 1 end end
+    return n
+  end
+  local hotkeys = 0
+  for _, hk in ipairs(hs._hotkeys) do if not hk.deleted then hotkeys = hotkeys + 1 end end
+  return {
+    hotkeys = hotkeys,
+    keyTaps = hs._runningTaps(10),
+    mouseTaps = hs._runningTaps(5),
+    repeatingTimers = timers.repeating,
+    oneShotTimers = timers.oneShot,
+    windowFilterSubs = #hs._wfSubscribers,
+    appWatchers = running(hs._appWatchers),
+    screenWatchers = running(hs._screenWatchers),
+    spaceWatchers = running(hs._spaceWatchers),
+    cards = H.liveCanvases(hs),
+    sensors = H.liveSensors(hs),
+  }
 end
 
 return H

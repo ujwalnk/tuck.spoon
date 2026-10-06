@@ -12,12 +12,15 @@ local M = {}
 -- each option.
 M.defaults = {
   shortcuts = {
-    -- Table form: {mods = {"fn"}, key = "t"} so that Fn (which is not a
-    -- normal hs.hotkey modifier) can be expressed uniformly. `mods` may
-    -- contain any of: "cmd", "alt", "shift", "ctrl", "fn".
+    -- Table form: {mods = {"alt"}, key = "f3"}. `mods` may contain any of:
+    -- "cmd", "alt", "shift", "ctrl". The shortcut is registered with a
+    -- plain hs.hotkey (no permanent keyboard eventtap). Fn is NOT a
+    -- supported modifier.
     -- ONE shortcut for everything: press it, then an arrow key to tuck
     -- the focused window, or letters to search tucked apps and restore.
-    tuck = { mods = { "fn" }, key = "t" },
+    -- (On a laptop keyboard, F3 needs "Use F1, F2, etc. keys as standard
+    -- function keys" enabled, or hold fn while pressing it.)
+    tuck = { mods = { "alt" }, key = "f3" },
   },
 
   input = {
@@ -123,7 +126,7 @@ local VALID_ORIGINS = { center = true, start = true, ["end"] = true }
 local VALID_EDGES = { left = true, right = true, top = true, bottom = true }
 local VALID_SCOPES = { screenAndSpace = true, space = true }
 local VALID_LOG_LEVELS = { debug = true, info = true, warning = true, error = true }
-local VALID_MODS = { cmd = true, alt = true, shift = true, ctrl = true, fn = true }
+local VALID_MODS = { cmd = true, alt = true, shift = true, ctrl = true }
 
 --- Deep-copy a plain table (no metatables, no cycles expected).
 local function deepcopy(value)
@@ -141,7 +144,7 @@ M.deepcopy = deepcopy
 --- Config fields that hold a LIST (currently only a shortcut's `mods`)
 -- rather than a nested settings table. An override for one of these must
 -- REPLACE the default wholesale, never merge key-by-key: merging {} onto
--- {"fn"} would otherwise leave the default "fn" in place, silently
+-- {"alt"} would otherwise leave the default "alt" in place, silently
 -- turning an override meant to clear every modifier into a no-op. This
 -- is a fixed, named set rather than a "does it look like an array"
 -- guess, because an empty table is ambiguous (e.g. an override of
@@ -216,6 +219,9 @@ local function validateShortcut(name, spec)
       return false, name .. " shortcut `mods` must be a table"
     end
     for _, m in ipairs(spec.mods) do
+      if m == "fn" then
+        return false, name .. ' shortcut: the "fn" modifier is no longer supported (use cmd/alt/shift/ctrl; the default is Option+F3)'
+      end
       if not VALID_MODS[m] then
         return false, string.format("%s shortcut has unknown modifier %q", name, tostring(m))
       end

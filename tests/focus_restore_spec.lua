@@ -53,8 +53,8 @@ end
 --- Tuck the CURRENTLY focused window (as tracked by _userFocus) toward
 -- `edge` via the real shortcut + arrow, exactly as a user would.
 local function tuckCurrent(hs, edge)
-  hs._sendKeyDown({ keyCode = K.t, flags = { fn = true } })
-  hs._sendKeyDown({ keyCode = K[edge], flags = { fn = true } })
+  hs._pressHotkey({ "alt" }, "f3")
+  hs._sendKeyDown({ keyCode = K[edge], flags = {} })
 end
 
 local function run()
